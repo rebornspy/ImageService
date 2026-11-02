@@ -195,20 +195,14 @@ function ImageService:GetImage(url): imageData
     return dataTable
 end
 
-function ImageService:GetScaledSize(width, height, scale): Vector2
-    scale = scale or 0.8
-
-    local viewport =
-        workspace.CurrentCamera.ViewportSize
-
-    local factor = math.min(
-        viewport.X * scale / width,
-        viewport.Y * scale / height
-    )
+function ImageService:CalculateNewSize(width, height, targetWidth): Vector2
+    local aspectRatio = height / width
+    local targetW = targetWidth or 500
+    local targetHeight = targetW * aspectRatio
 
     return Vector2.new(
-        width * factor,
-        height * factor
+        targetWidth,
+        targetHeight
     )
 end
 
@@ -221,7 +215,7 @@ end
 function ImageService:Create(url)
     local imageInfo = ImageService:GetImage(url)
 
-    local size = ImageService:GetScaledSize(
+    local size = Vector2.new(
         imageInfo.Width,
         imageInfo.Height
     )
