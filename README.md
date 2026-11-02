@@ -17,7 +17,7 @@ Supports reading image dimensions directly from binary image data without writin
 
 # Features
 
-- Download images from URLs
+- Fetch images from URLs
 - Detect image format automatically
 - Read dimensions directly from binary data
 - Preserve aspect ratios
@@ -66,8 +66,9 @@ data: string
 ### Returns
 
 ```lua
-width: number
-height: number
+width: number?
+height: number?
+error: string?
 ```
 
 ### Example
@@ -157,10 +158,10 @@ url: string
 
 ```lua
 {
-    Data = string,
-    Width = number,
-    Height = number,
-    StatusCode = number
+    Data: string,
+    Width: number,
+    Height: number,
+    StatusCode: number
 }
 ```
 
@@ -190,7 +191,7 @@ targetWidth: number
 ### Returns
 
 ```lua
-Vector2
+size: Vector2
 ```
 
 ### Example
@@ -209,7 +210,7 @@ print(newSize)
 Result:
 
 ```lua
-Vector2.new(500, 281.25)
+Vector2.new(500, 281.25) -- Rounded down to 281
 ```
 
 ---
@@ -227,7 +228,7 @@ size: Vector2
 ### Returns
 
 ```lua
-Vector2
+position: Vector2
 ```
 
 ### Example
@@ -254,7 +255,7 @@ url: string
 ### Returns
 
 ```lua
-DrawingImage
+image: DrawingImage
 ```
 
 ### Example
@@ -318,7 +319,7 @@ local ImageService = loadstring(game:HttpGet(
 
 ```lua
 local image = ImageService:Create(
-    "https://static.wikia.nocookie.net/charlie-the-steak/images/c/c9/Charlie.png"
+    "https://static.wikia.nocookie.net/charlie-the-steak/images/c/c9/Charlie.png" -- Creates an image of Charlie the Steak, because who wouldn't want him on their screen?
 )
 ```
 
@@ -331,9 +332,9 @@ local imageInfo = ImageService:GetImage(
     "https://static.wikia.nocookie.net/charlie-the-steak/images/c/c9/Charlie.png"
 )
 
-print("Width:", imageInfo.Width)
-print("Height:", imageInfo.Height)
-print("Status:", imageInfo.StatusCode)
+print(`Width: {imageInfo.Width}`)
+print(`Height: {imageInfo.Height}`)
+print(`Status: {imageInfo.StatusCode}`)
 ```
 
 ---
@@ -341,20 +342,18 @@ print("Status:", imageInfo.StatusCode)
 ## Resizing While Preserving Aspect Ratio
 
 ```lua
+local image = ImageService:Create(url)
+
 local imageInfo = ImageService:GetImage(url)
 
 local size = ImageService:CalculateNewSize(
-    imageInfo.Width,
-    imageInfo.Height,
+    imageInfo.Width, -- can also use image.Width
+    imageInfo.Height, -- can also use image.Height
     500
 )
 
-local image = Drawing.new("Image")
-
-image.Data = imageInfo.Data
 image.Size = size
 image.Position = ImageService:GetCenteredPosition(size)
-image.Visible = true
 ```
 
 ---
