@@ -347,8 +347,8 @@ local image = ImageService:Create(url)
 local imageInfo = ImageService:GetImage(url)
 
 local size = ImageService:CalculateNewSize(
-    imageInfo.Width, -- can also use image.Width
-    imageInfo.Height, -- can also use image.Height
+    imageInfo.Width, -- can also use image.Size.X
+    imageInfo.Height, -- can also use image.Size.Y
     500
 )
 
