@@ -1248,7 +1248,6 @@ function ImageService:GetImage(url, options): imageData
 			Method = "GET",
 			Headers = {
 				["User-Agent"] = "Mozilla/5.0",
-				["Referer"] = "https://gelbooru.com/"
 				["Accept"] = "image/png,image/jpeg,image/webp,*/*;q=0.8",
 			},
 		})
