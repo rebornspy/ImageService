@@ -191,6 +191,21 @@ function ImageService:GetImage(url): imageData
 
         data = converted.Body
 
+		print("[ImageService] Conversion status:", converted.StatusCode)
+		print("[ImageService] Response size:", #data)
+		print("[ImageService] Content-Type:",
+			converted.Headers and (
+				converted.Headers["Content-Type"]
+				or converted.Headers["content-type"]
+			)
+		)
+		
+		print("[ImageService] First 16 bytes:", data:sub(1, 16):byte(1, 16))
+		print("[ImageService] PNG signature:", data:sub(1, 8) == "\137PNG\r\n\26\n")
+		print("[ImageService] JPEG signature:",
+			data:byte(1) == 0xFF and data:byte(2) == 0xD8
+		)
+
         assert(
             data:sub(1, 8) == "\137PNG\r\n\26\n",
             "Conversion service did not return PNG data"
