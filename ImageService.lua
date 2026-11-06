@@ -1,5 +1,13 @@
 local ImageService = {}
 
+-- All GIF progress output uses one consistent prefix.
+-- Pass Progress = false to GetGIF/DecodeGIF, PrepareGIF, or PlayGIF to silence that stage.
+local function GIFProgress(message, enabled)
+    if enabled ~= false then
+        print("[ImageService-GIF]: " .. tostring(message))
+    end
+end
+
 -- NORMAL IMAGES (PNG, JPEG, WEBP)
 
 local function ReadPNGSize(data): (number, number)
@@ -672,6 +680,10 @@ end
 function ImageService:DecodeGIF(data, limits)
     limits = limits or {}
 
+    local progressEnabled = limits.Progress ~= false
+    local progressEvery = math.max(1, math.floor(tonumber(limits.ProgressEveryFrames) or 10))
+    GIFProgress("Starting decoder...", progressEnabled)
+
     local MAX_PIXELS = limits.MaxPixels or 4000000
     local MAX_FRAMES = limits.MaxFrames or 500
     local outputScale = limits.Scale or 1
@@ -703,6 +715,10 @@ function ImageService:DecodeGIF(data, limits)
         local totalPixels = width * height
         local outputWidth = math.max(1, math.floor(width * outputScale + 0.5))
         local outputHeight = math.max(1, math.floor(height * outputScale + 0.5))
+        GIFProgress(string.format(
+            "Canvas detected: %dx%d; decoded output: %dx%d.",
+            width, height, outputWidth, outputHeight
+        ), progressEnabled)
 
         if totalPixels > MAX_PIXELS then
             warn("GIF exceeds maximum canvas dimensions")
@@ -981,6 +997,10 @@ function ImageService:DecodeGIF(data, limits)
                     Top = top
                 }
 
+                if #frames == 1 or #frames % progressEvery == 0 then
+                    GIFProgress(string.format("Decoded %d frames...", #frames), progressEnabled)
+                end
+
                 previousFrame = frame
                 previousSnapshot = snapshot
 
@@ -1018,35 +1038,68 @@ function ImageService:DecodeGIF(data, limits)
     end)
 
     if not success then
+        GIFProgress("Decoder failed: " .. tostring(result), progressEnabled)
         return nil, tostring(result)
     end
 
+    GIFProgress(string.format("Decoding complete: %d frames.", result.FrameCount), progressEnabled)
     return result
 end
 
 --// DOWNLOAD AND DECODE GIF
 
 function ImageService:GetGIF(url, limits)
-    local response = request({
-        Url = url,
-        Method = "GET"
-    })
+    limits = limits or {}
+    local progressEnabled = limits.Progress ~= false
 
-    if not response or not response.Body then
-        return nil, "Empty HTTP response"
+    GIFProgress("Sending HTTP request...", progressEnabled)
+
+    local requestOK, response = pcall(function()
+        return request({
+            Url = url,
+            Method = "GET"
+        })
+    end)
+
+    if not requestOK then
+        local err = "HTTP request failed: " .. tostring(response)
+        GIFProgress(err, progressEnabled)
+        return nil, err
+    end
+
+    GIFProgress("HTTP request returned.", progressEnabled)
+
+    if not response or type(response.Body) ~= "string" then
+        local err = "Empty or invalid HTTP response"
+        GIFProgress(err, progressEnabled)
+        return nil, err
     end
 
     if response.StatusCode < 200 or response.StatusCode >= 300 then
-        return nil, "HTTP warn: " .. tostring(response.StatusCode)
+        local err = "HTTP error: " .. tostring(response.StatusCode)
+        GIFProgress(err, progressEnabled)
+        return nil, err
     end
 
+    GIFProgress(string.format(
+        "Downloaded %d bytes (HTTP %s).",
+        #response.Body,
+        tostring(response.StatusCode)
+    ), progressEnabled)
     local animation, err = self:DecodeGIF(response.Body, limits)
 
     if not animation then
+        GIFProgress("GIF decoding failed: " .. tostring(err), progressEnabled)
         return nil, err
     end
 
     animation.StatusCode = response.StatusCode
+    GIFProgress(string.format(
+        "GIF ready: %dx%d, %d frames.",
+        animation.Width,
+        animation.Height,
+        animation.FrameCount
+    ), progressEnabled)
 
     return animation
 end
@@ -1064,8 +1117,16 @@ function ImageService:PrepareGIF(animation, options)
     assert(animation and animation.Frames, "Invalid GIF animation")
     assert(#animation.Frames > 0, "GIF contains no frames")
 
+    local progressEnabled = options.Progress ~= false
     local releaseRGBA = options.ReleaseRGBA ~= false
     local yieldEvery = math.max(1, math.floor(tonumber(options.YieldEveryFrames) or 1))
+    local frameCount = #animation.Frames
+    local progressEvery = math.max(
+        1,
+        math.floor(tonumber(options.ProgressEveryFrames) or math.max(1, math.ceil(frameCount / 10)))
+    )
+
+    GIFProgress(string.format("Preparing %d frames as PNG...", frameCount), progressEnabled)
 
     local prepared = {
         Frames = table.create(#animation.Frames),
@@ -1080,7 +1141,11 @@ function ImageService:PrepareGIF(animation, options)
     }
 
     for i, frame in ipairs(animation.Frames) do
-        assert(type(frame.Data) == "string", "GIF frame " .. i .. " has no RGBA Data")
+        if type(frame.Data) ~= "string" then
+            local err = "GIF frame " .. i .. " has no RGBA Data"
+            GIFProgress("Preparation failed: " .. err, progressEnabled)
+            error(err)
+        end
 
         local png, err = self:EncodePNG(
             frame.Data,
@@ -1089,7 +1154,9 @@ function ImageService:PrepareGIF(animation, options)
         )
 
         if not png then
-            error("Failed to encode GIF frame " .. i .. ": " .. tostring(err))
+            local message = "Failed to encode GIF frame " .. i .. ": " .. tostring(err)
+            GIFProgress("Preparation failed: " .. message, progressEnabled)
+            error(message)
         end
 
         prepared.Frames[i] = {
@@ -1103,6 +1170,15 @@ function ImageService:PrepareGIF(animation, options)
             frame.Data = nil
         end
 
+        if i == 1 or i % progressEvery == 0 or i == frameCount then
+            GIFProgress(string.format(
+                "Prepared %d/%d frames (%.0f%%).",
+                i,
+                frameCount,
+                (i / frameCount) * 100
+            ), progressEnabled)
+        end
+
         if i % yieldEvery == 0 then
             task.wait()
         end
@@ -1113,6 +1189,7 @@ function ImageService:PrepareGIF(animation, options)
         animation.Frames = nil
     end
 
+    GIFProgress(string.format("Preparation complete: %d PNG frames ready.", prepared.FrameCount), progressEnabled)
     return prepared
 end
 
@@ -1132,6 +1209,12 @@ function ImageService:PlayGIF(animation, image, options)
     local frameCount = #frames
     assert(frameCount > 0, "GIF contains no frames")
 
+    local progressEnabled = options.Progress ~= false
+    local progressEvery = math.max(
+        1,
+        math.floor(tonumber(options.ProgressEveryFrames) or math.max(1, math.ceil(frameCount / 10)))
+    )
+
     local minDelay = math.max(tonumber(options.MinDelay) or (1 / 60), 0.001)
     local maxFPS = tonumber(options.MaxFPS)
     if maxFPS and maxFPS <= 0 then
@@ -1143,7 +1226,8 @@ function ImageService:PlayGIF(animation, image, options)
         self:FitGIF(image, animation, image.Size)
     end
 
-    local playback = { Running = true }
+    local playback = { Running = true, StopRequested = false }
+    GIFProgress(string.format("Playback started: %d frames.", frameCount), progressEnabled)
 
     task.spawn(function()
         local index = 1
@@ -1164,7 +1248,7 @@ function ImageService:PlayGIF(animation, image, options)
         while playback.Running do
             local frame = frames[index]
             if not frame or type(frame.Data) ~= "string" then
-                warn("GIF playback stopped: prepared frame " .. index .. " is missing PNG data")
+                GIFProgress("Playback stopped: prepared frame " .. index .. " is missing PNG data.", progressEnabled)
                 break
             end
 
@@ -1173,8 +1257,17 @@ function ImageService:PlayGIF(animation, image, options)
             end)
 
             if not assigned then
-                warn("GIF playback image update failed:", assignError)
+                GIFProgress("Playback image update failed: " .. tostring(assignError), progressEnabled)
                 break
+            end
+
+            if index == 1 or index % progressEvery == 0 then
+                GIFProgress(string.format(
+                    "Playing frame %d/%d (play %d).",
+                    index,
+                    frameCount,
+                    completedPlays + 1
+                ), progressEnabled)
             end
 
             local delay = tonumber(frame.Delay) or 0.1
@@ -1202,19 +1295,30 @@ function ImageService:PlayGIF(animation, image, options)
         end
 
         playback.Running = false
+        if playback.StopRequested then
+            GIFProgress("Playback stopped.", progressEnabled)
+        else
+            GIFProgress("Playback finished.", progressEnabled)
+        end
     end)
 
     return function()
-        playback.Running = false
+        if playback.Running then
+            playback.StopRequested = true
+            playback.Running = false
+        end
     end
 end
 
 -- Releases all encoded PNG frames held by a prepared animation.
 -- Call this after stopping playback when the GIF will not be reused.
-function ImageService:ClearPreparedGIF(prepared)
+function ImageService:ClearPreparedGIF(prepared, options)
     if not prepared then
         return
     end
+
+    local progressEnabled = not (options and options.Progress == false)
+    GIFProgress("Clearing prepared PNG frames...", progressEnabled)
 
     if prepared.Frames then
         for _, frame in ipairs(prepared.Frames) do
@@ -1226,6 +1330,7 @@ function ImageService:ClearPreparedGIF(prepared)
 
     prepared.FrameCount = 0
     prepared.IsPrepared = false
+    GIFProgress("Prepared frame data cleared.", progressEnabled)
 end
 
 local function UInt32BE(value)
@@ -1504,6 +1609,9 @@ FUNCTIONS:
 
     * GetGIF(url, limits)
         - Downloads a GIF and decodes it using the optional limits table.
+        - Prints progress messages prefixed with [ImageService-GIF]:.
+        - ProgressEveryFrames controls decoder log frequency (default 10).
+        - Set limits.Progress = false to silence GIF download/decoding logs.
 
     GIF PREPARATION & PLAYBACK:
     * PrepareGIF(animation, options)
@@ -1513,6 +1621,7 @@ FUNCTIONS:
           data after each successful PNG encode to reduce retained memory.
           Set ReleaseRGBA = false to keep the source frames.
         - YieldEveryFrames controls how often preparation yields (default 1).
+        - ProgressEveryFrames controls log frequency; Progress = false silences logs.
 
     * PlayGIF(prepared, image, options)
         - Playback only assigns pre-encoded PNG frames; it does no encoding.
@@ -1520,6 +1629,8 @@ FUNCTIONS:
         - PreserveAspect defaults to true and fits the GIF inside the
           Drawing image's initial Size bounding box without stretching.
         - Returns a stop function.
+        - Logs start, periodic frame progress, and stop/completion status.
+        - ProgressEveryFrames controls log frequency; Progress = false silences logs.
 
     * ClearPreparedGIF(prepared)
         - Clears encoded PNG frame data when the prepared animation is
