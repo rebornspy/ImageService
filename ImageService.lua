@@ -290,531 +290,951 @@ local function JPEGIDCT(coefficients, quantization)
 	return output
 end
 
+--// BASELINE + PROGRESSIVE JPEG DECODER
+-- Drop-in replacement for the existing DecodeJPEG() function.
+-- Requires the existing helpers/constants above it:
+-- JPEG_ZIGZAG, JPEGBuildHuffman, JPEGExtend, JPEGIDCT,
+-- JPEGClamp, and JPEGReadU16.
+-- Supports 8-bit SOF0 and SOF2 Huffman JPEGs, grayscale and
+-- three-component YCbCr, common sampling factors, spectral selection,
+-- successive approximation, EOB runs, and restart markers.
+
 local function DecodeJPEG(data, options)
-	options = options or {}
-
-	assert(type(data) == "string", "JPEG data must be a string")
-	assert(data:byte(1) == 0xFF and data:byte(2) == 0xD8, "Invalid JPEG signature")
-
-	local maxPixels = tonumber(options.MaxPixels) or 8000000
-	local pos = 3
-
-	local width
-	local height
-	local components
-	local componentByID = {}
-
-	local quantizationTables = {}
-	local huffmanTables = {
-		[0] = {},
-		[1] = {},
-	}
-
-	local restartInterval = 0
-	local scanComponents
-	local scanPosition
-
-	while pos <= #data do
-		if data:byte(pos) ~= 0xFF then
-			error("Invalid JPEG marker alignment")
-		end
-
-		while data:byte(pos) == 0xFF do
-			pos += 1
-		end
-
-		local marker = data:byte(pos)
-		pos += 1
-
-		if not marker then
-			error("Unexpected end of JPEG markers")
-		end
-
-		if marker == 0xD9 then
-			error("JPEG ended before its scan")
-		elseif marker == 0xDA then
-			local length = JPEGReadU16(data, pos)
-			local payload = pos + 2
-			local count = data:byte(payload)
-
-			if not count or count < 1 then
-				error("Invalid JPEG scan header")
-			end
-
-			scanComponents = {}
-
-			for i = 1, count do
-				local offset = payload + 1 + (i - 1) * 2
-				local id = data:byte(offset)
-				local selector = data:byte(offset + 1)
-
-				local component = componentByID[id]
-				if not component then
-					error("JPEG scan references an unknown component")
-				end
-
-				local dcID = bit32.rshift(selector, 4)
-				local acID = bit32.band(selector, 0x0F)
-
-				scanComponents[i] = {
-					Component = component,
-					DC = huffmanTables[0][dcID],
-					AC = huffmanTables[1][acID],
-				}
-
-				if not scanComponents[i].DC or not scanComponents[i].AC then
-					error("JPEG scan references a missing Huffman table")
-				end
-			end
-
-			local spectralStart = data:byte(payload + 1 + count * 2)
-			local spectralEnd = data:byte(payload + 2 + count * 2)
-			local successive = data:byte(payload + 3 + count * 2)
-
-			if spectralStart ~= 0 or spectralEnd ~= 63 or successive ~= 0 then
-				error("Unsupported JPEG scan mode; baseline sequential scans are required")
-			end
-
-			if length < 6 + count * 2 then
-				error("Invalid JPEG scan segment length")
-			end
-
-			scanPosition = pos + length
-			break
-		else
-			if marker == 0xD8 or marker == 0x01
-				or (marker >= 0xD0 and marker <= 0xD7) then
-				continue
-			end
-
-			local length = JPEGReadU16(data, pos)
-
-			if length < 2 or pos + length - 1 > #data then
-				error("Invalid JPEG segment length")
-			end
-
-			local payload = pos + 2
-			local payloadEnd = pos + length - 1
-
-			if marker == 0xC0 then
-				local precision = data:byte(payload)
-				height = JPEGReadU16(data, payload + 1)
-				width = JPEGReadU16(data, payload + 3)
-
-				local count = data:byte(payload + 5)
-
-				if precision ~= 8 then
-					error("Only 8-bit JPEG images are supported")
-				end
-
-				if not width or not height or width < 1 or height < 1 then
-					error("Invalid JPEG dimensions")
-				end
-
-				if width * height > maxPixels then
-					error("JPEG exceeds the configured pixel limit")
-				end
-
-				if count ~= 1 and count ~= 3 then
-					error("Only grayscale and three-component JPEGs are supported")
-				end
-
-				components = {}
-				componentByID = {}
-
-				for i = 1, count do
-					local offset = payload + 6 + (i - 1) * 3
-					local id = data:byte(offset)
-					local sampling = data:byte(offset + 1)
-					local quantID = data:byte(offset + 2)
-
-					local horizontal = bit32.rshift(sampling, 4)
-					local vertical = bit32.band(sampling, 0x0F)
-
-					if horizontal < 1 or horizontal > 4
-						or vertical < 1 or vertical > 4 then
-						error("Invalid JPEG sampling factors")
-					end
-
-					local component = {
-						ID = id,
-						H = horizontal,
-						V = vertical,
-						QuantID = quantID,
-						DC = 0,
-					}
-
-					components[i] = component
-					componentByID[id] = component
-				end
-			elseif marker == 0xC2 then
-				error("Progressive JPEG is not supported yet")
-			elseif marker == 0xDB then
-				local cursor = payload
-
-				while cursor <= payloadEnd do
-					local info = data:byte(cursor)
-					cursor += 1
-
-					local precision = bit32.rshift(info, 4)
-					local tableID = bit32.band(info, 0x0F)
-
-					if precision ~= 0 then
-						error("16-bit JPEG quantization tables are not supported")
-					end
-
-					local quant = table.create(64)
-
-					for i = 1, 64 do
-						local value = data:byte(cursor)
-
-						if not value then
-							error("Incomplete JPEG quantization table")
-						end
-
-						quant[JPEG_ZIGZAG[i] + 1] = value
-						cursor += 1
-					end
-
-					quantizationTables[tableID] = quant
-				end
-			elseif marker == 0xC4 then
-				local cursor = payload
-
-				while cursor <= payloadEnd do
-					local info = data:byte(cursor)
-					cursor += 1
-
-					local tableClass = bit32.rshift(info, 4)
-					local tableID = bit32.band(info, 0x0F)
-
-					if tableClass > 1 then
-						error("Invalid JPEG Huffman table class")
-					end
-
-					local counts = table.create(16)
-					local total = 0
-
-					for i = 1, 16 do
-						local count = data:byte(cursor)
-
-						if count == nil then
-							error("Incomplete JPEG Huffman table")
-						end
-
-						counts[i] = count
-						total += count
-						cursor += 1
-					end
-
-					local symbols = table.create(total)
-
-					for i = 1, total do
-						symbols[i] = data:byte(cursor)
-
-						if symbols[i] == nil then
-							error("Incomplete JPEG Huffman symbols")
-						end
-
-						cursor += 1
-					end
-
-					huffmanTables[tableClass][tableID] =
-						JPEGBuildHuffman(counts, symbols)
-				end
-			elseif marker == 0xDD then
-				restartInterval = JPEGReadU16(data, payload)
-			end
-
-			pos += length
-		end
-	end
-
-	if not scanPosition or not width or not height or not components then
-		error("JPEG is missing required frame or scan information")
-	end
-
-	local maxH = 1
-	local maxV = 1
-
-	for _, component in ipairs(components) do
-		maxH = math.max(maxH, component.H)
-		maxV = math.max(maxV, component.V)
-
-		if not quantizationTables[component.QuantID] then
-			error("JPEG component references a missing quantization table")
-		end
-	end
-
-	if #components == 3 then
-		if maxH % 1 ~= 0 or maxV % 1 ~= 0 then
-			error("Invalid JPEG sampling configuration")
-		end
-	end
-
-	local mcuWidth = maxH * 8
-	local mcuHeight = maxV * 8
-	local mcuColumns = math.ceil(width / mcuWidth)
-	local mcuRows = math.ceil(height / mcuHeight)
-	local totalMCUs = mcuColumns * mcuRows
-
-	for _, component in ipairs(components) do
-		component.PlaneWidth = mcuColumns * component.H * 8
-		component.PlaneHeight = mcuRows * component.V * 8
-		component.Plane = table.create(component.PlaneWidth * component.PlaneHeight, 0)
-	end
-
-	local bitBuffer = 0
-	local bitCount = 0
-	local bytePosition = scanPosition
-
-	local function ReadEntropyBit()
-		if bitCount == 0 then
-			local value = data:byte(bytePosition)
-
-			if value == nil then
-				error("JPEG entropy stream ended unexpectedly")
-			end
-
-			bytePosition += 1
-
-			if value == 0xFF then
-				local following = data:byte(bytePosition)
-
-				if following == 0x00 then
-					bytePosition += 1
-				else
-					error("Unexpected JPEG marker inside entropy data")
-				end
-			end
-
-			bitBuffer = value
-			bitCount = 8
-		end
-
-		local bit = bit32.band(bit32.rshift(bitBuffer, bitCount - 1), 1)
-		bitCount -= 1
-
-		return bit
-	end
-
-	local function ReadEntropyBits(count)
-		local value = 0
-
-		for _ = 1, count do
-			value = value * 2 + ReadEntropyBit()
-		end
-
-		return value
-	end
-
-	local function ReadHuffman(tableData)
-		local code = 0
-
-		for length = 1, 16 do
-			code = code * 2 + ReadEntropyBit()
-
-			local entries = tableData[length]
-			local symbol = entries and entries[code]
-
-			if symbol ~= nil then
-				return symbol
-			end
-		end
-
-		error("Invalid JPEG Huffman code")
-	end
-
-	local function DecodeBlock(component, dcTable, acTable)
-		local coefficients = table.create(64, 0)
-
-		local dcLength = ReadHuffman(dcTable)
-
-		if dcLength > 11 then
-			error("Invalid JPEG DC coefficient length")
-		end
-
-		local difference = JPEGExtend(ReadEntropyBits(dcLength), dcLength)
-		component.DC += difference
-		coefficients[1] = component.DC
-
-		local k = 1
-
-		while k < 64 do
-			local symbol = ReadHuffman(acTable)
-			local run = bit32.rshift(symbol, 4)
-			local size = bit32.band(symbol, 0x0F)
-
-			if size == 0 then
-				if run == 0 then
-					break
-				elseif run == 15 then
-					k += 16
-				else
-					error("Invalid JPEG AC run")
-				end
-			else
-				k += run
-
-				if k > 63 then
-					error("JPEG AC coefficient exceeds block")
-				end
-
-				local value = JPEGExtend(ReadEntropyBits(size), size)
-				coefficients[JPEG_ZIGZAG[k + 1] + 1] = value
-				k += 1
-			end
-		end
-
-		return JPEGIDCT(coefficients, quantizationTables[component.QuantID])
-	end
-
-	local function StoreBlock(component, block, blockX, blockY)
-		local plane = component.Plane
-		local planeWidth = component.PlaneWidth
-		local startX = blockX * 8
-		local startY = blockY * 8
-
-		for y = 0, 7 do
-			local destination = (startY + y) * planeWidth + startX + 1
-			local source = y * 8
-
-			for x = 0, 7 do
-				plane[destination + x] = block[source + x + 1]
-			end
-		end
-	end
-
-	local function ResetEntropyForRestart(expectedMarker)
-		bitBuffer = 0
-		bitCount = 0
-
-		if data:byte(bytePosition) ~= 0xFF then
-			error("JPEG restart marker is missing")
-		end
-
-		while data:byte(bytePosition) == 0xFF do
-			bytePosition += 1
-		end
-
-		local marker = data:byte(bytePosition)
-		bytePosition += 1
-
-		if marker ~= expectedMarker then
-			error("Unexpected JPEG restart marker")
-		end
-
-		for _, component in ipairs(components) do
-			component.DC = 0
-		end
-	end
-
-	local mcuIndex = 0
-	local restartNumber = 0
-
-	for mcuY = 0, mcuRows - 1 do
-		for mcuX = 0, mcuColumns - 1 do
-			mcuIndex += 1
-
-			for _, scanComponent in ipairs(scanComponents) do
-				local component = scanComponent.Component
-
-				for blockY = 0, component.V - 1 do
-					for blockX = 0, component.H - 1 do
-						local block = DecodeBlock(
-							component,
-							scanComponent.DC,
-							scanComponent.AC
-						)
-
-						StoreBlock(
-							component,
-							block,
-							mcuX * component.H + blockX,
-							mcuY * component.V + blockY
-						)
-					end
-				end
-			end
-
-			if restartInterval > 0
-				and mcuIndex < totalMCUs
-				and mcuIndex % restartInterval == 0 then
-
-				ResetEntropyForRestart(0xD0 + restartNumber)
-				restartNumber = (restartNumber + 1) % 8
-			end
-
-			if mcuIndex % 256 == 0 then
-				task.wait()
-			end
-		end
-	end
-
-	local outputChunks = {}
-	local outputChunk = {}
-	local outputCount = 0
-	local pixelCount = width * height
-
-	local yComponent = components[1]
-	local cbComponent = components[2]
-	local crComponent = components[3]
-
-	local function GetPlaneSample(component, x, y)
-		local sampleX = math.floor(x * component.H / maxH)
-		local sampleY = math.floor(y * component.V / maxV)
-
-		sampleX = math.min(sampleX, component.PlaneWidth - 1)
-		sampleY = math.min(sampleY, component.PlaneHeight - 1)
-
-		return component.Plane[sampleY * component.PlaneWidth + sampleX + 1]
-	end
-
-	for y = 0, height - 1 do
-		for x = 0, width - 1 do
-			local red
-			local green
-			local blue
-
-			if #components == 1 then
-				local gray = GetPlaneSample(yComponent, x, y)
-				red, green, blue = gray, gray, gray
-			else
-				local luminance = GetPlaneSample(yComponent, x, y)
-				local cb = GetPlaneSample(cbComponent, x, y) - 128
-				local cr = GetPlaneSample(crComponent, x, y) - 128
-
-				red = JPEGClamp(luminance + 1.402 * cr)
-				green = JPEGClamp(luminance - 0.344136 * cb - 0.714136 * cr)
-				blue = JPEGClamp(luminance + 1.772 * cb)
-			end
-
-			outputCount += 1
-			outputChunk[#outputChunk + 1] = red
-			outputChunk[#outputChunk + 1] = green
-			outputChunk[#outputChunk + 1] = blue
-			outputChunk[#outputChunk + 1] = 255
-
-			if #outputChunk >= 4096 then
-				outputChunks[#outputChunks + 1] = string.char(table.unpack(outputChunk))
-				table.clear(outputChunk)
-			end
-		end
-
-		if y % 32 == 0 then
-			task.wait()
-		end
-	end
-
-	if #outputChunk > 0 then
-		outputChunks[#outputChunks + 1] = string.char(table.unpack(outputChunk))
-	end
-
-	if outputCount ~= pixelCount then
-		error("JPEG decoder produced an incorrect pixel count")
-	end
-
-	return table.concat(outputChunks), width, height
+    options = options or {}
+
+    assert(type(data) == "string", "JPEG data must be a string")
+    assert(data:byte(1) == 0xFF and data:byte(2) == 0xD8, "Invalid JPEG signature")
+
+    local maxPixels = math.floor(tonumber(options.MaxPixels) or 8000000)
+    local maxBlocks = math.floor(tonumber(options.MaxBlocks) or 400000)
+    assert(maxPixels > 0, "MaxPixels must be positive")
+    assert(maxBlocks > 0, "MaxBlocks must be positive")
+
+    -- Use Luau buffers when available. This avoids millions of Lua table
+    -- entries for progressive DCT coefficients and component sample planes.
+    local bufferLib = buffer
+    local useBuffer = type(bufferLib) == "table"
+        and type(bufferLib.create) == "function"
+        and type(bufferLib.readi32) == "function"
+        and type(bufferLib.writei32) == "function"
+        and type(bufferLib.readu8) == "function"
+        and type(bufferLib.writeu8) == "function"
+
+    local function NewIntArray(length)
+        if useBuffer then
+            return { Buffer = bufferLib.create(length * 4), Length = length }
+        end
+        return { Values = table.create(length, 0), Length = length }
+    end
+
+    local function GetInt(array, index)
+        if index < 0 or index >= array.Length then
+            error("JPEG coefficient index is out of range")
+        end
+        if array.Buffer then
+            return bufferLib.readi32(array.Buffer, index * 4)
+        end
+        return array.Values[index + 1] or 0
+    end
+
+    local function SetInt(array, index, value)
+        if index < 0 or index >= array.Length then
+            error("JPEG coefficient index is out of range")
+        end
+        if array.Buffer then
+            bufferLib.writei32(array.Buffer, index * 4, value)
+        else
+            array.Values[index + 1] = value
+        end
+    end
+
+    local function NewByteArray(length)
+        if useBuffer then
+            return { Buffer = bufferLib.create(length), Length = length }
+        end
+        return { Values = table.create(length, 0), Length = length }
+    end
+
+    local function GetByte(array, index)
+        if index < 0 or index >= array.Length then
+            error("JPEG sample index is out of range")
+        end
+        if array.Buffer then
+            return bufferLib.readu8(array.Buffer, index)
+        end
+        return array.Values[index + 1] or 0
+    end
+
+    local function SetByte(array, index, value)
+        if index < 0 or index >= array.Length then
+            error("JPEG sample index is out of range")
+        end
+        if array.Buffer then
+            bufferLib.writeu8(array.Buffer, index, value)
+        else
+            array.Values[index + 1] = value
+        end
+    end
+
+    local pos = 3
+    local width, height
+    local components = nil
+    local componentByID = {}
+    local frameMode = nil -- "baseline" (SOF0) or "progressive" (SOF2)
+    local maxH, maxV
+    local mcuColumns, mcuRows
+    local quantizationTables = {}
+    local huffmanTables = { [0] = {}, [1] = {} }
+    local restartInterval = 0
+    local sawScan = false
+    local sawEOI = false
+    local decodedUnits = 0
+
+    local function InitializeFrame()
+        maxH, maxV = 1, 1
+
+        for _, component in ipairs(components) do
+            maxH = math.max(maxH, component.H)
+            maxV = math.max(maxV, component.V)
+        end
+
+        mcuColumns = math.ceil(width / (maxH * 8))
+        mcuRows = math.ceil(height / (maxV * 8))
+
+        local totalBlocks = 0
+
+        for _, component in ipairs(components) do
+            component.BlocksWide = mcuColumns * component.H
+            component.BlocksHigh = mcuRows * component.V
+            component.PlaneWidth = component.BlocksWide * 8
+            component.PlaneHeight = component.BlocksHigh * 8
+
+            local blockCount = component.BlocksWide * component.BlocksHigh
+            totalBlocks += blockCount
+
+            if totalBlocks > maxBlocks then
+                error("JPEG exceeds the configured coefficient block limit")
+            end
+
+            component.Coefficients = NewIntArray(blockCount * 64)
+            component.Progression = table.create(64)
+            component.DC = 0
+        end
+    end
+
+    local function GetCoefficient(component, blockIndex, naturalIndex)
+        return GetInt(component.Coefficients, blockIndex * 64 + naturalIndex)
+    end
+
+    local function SetCoefficient(component, blockIndex, naturalIndex, value)
+        SetInt(component.Coefficients, blockIndex * 64 + naturalIndex, value)
+    end
+
+    local function BuildEntropyReader(startPosition)
+        local bytePosition = startPosition
+        local bitBuffer = 0
+        local bitsLeft = 0
+
+        local function ReadBit()
+            if bitsLeft == 0 then
+                local value = data:byte(bytePosition)
+                if value == nil then
+                    error("JPEG entropy stream ended unexpectedly")
+                end
+                bytePosition += 1
+
+                -- Entropy-coded 0xFF bytes are byte-stuffed as FF 00.
+                if value == 0xFF then
+                    local following = data:byte(bytePosition)
+                    if following ~= 0x00 then
+                        error("Unexpected marker inside JPEG entropy data")
+                    end
+                    bytePosition += 1
+                end
+
+                bitBuffer = value
+                bitsLeft = 8
+            end
+
+            local result = bit32.band(bit32.rshift(bitBuffer, bitsLeft - 1), 1)
+            bitsLeft -= 1
+            return result
+        end
+
+        local function ReadBits(count)
+            local value = 0
+            for _ = 1, count do
+                value = value * 2 + ReadBit()
+            end
+            return value
+        end
+
+        local function ReadHuffman(tableData)
+            if not tableData then
+                error("JPEG scan references a missing Huffman table")
+            end
+
+            local code = 0
+            for length = 1, 16 do
+                code = code * 2 + ReadBit()
+                local entries = tableData[length]
+                local symbol = entries and entries[code]
+                if symbol ~= nil then
+                    return symbol
+                end
+            end
+
+            error("Invalid JPEG Huffman code")
+        end
+
+        local function ConsumeRestart(expectedMarker)
+            -- Discard the remainder of the current entropy byte.
+            bitBuffer = 0
+            bitsLeft = 0
+
+            if data:byte(bytePosition) ~= 0xFF then
+                error("JPEG restart marker is missing")
+            end
+
+            while data:byte(bytePosition) == 0xFF do
+                bytePosition += 1
+            end
+
+            local marker = data:byte(bytePosition)
+            bytePosition += 1
+
+            if marker ~= expectedMarker then
+                error("Unexpected JPEG restart marker")
+            end
+        end
+
+        local function GetPosition()
+            return bytePosition
+        end
+
+        return ReadBit, ReadBits, ReadHuffman, ConsumeRestart, GetPosition
+    end
+
+    local function DecodeScan(scanComponents, spectralStart, spectralEnd, ah, al, entropyStart)
+        local isDCScan = spectralStart == 0
+        local isSequential = frameMode == "baseline"
+
+        if isSequential then
+            if spectralStart ~= 0 or spectralEnd ~= 63 or ah ~= 0 or al ~= 0 then
+                error("Invalid sequential JPEG scan parameters")
+            end
+        else
+            if ah > 0 and al ~= ah - 1 then
+                error("Invalid progressive JPEG successive-approximation order")
+            end
+
+            if isDCScan then
+                if spectralEnd ~= 0 then
+                    error("Progressive DC scans must use spectral range 0..0")
+                end
+            else
+                if spectralStart < 1 or spectralStart > spectralEnd or spectralEnd > 63 then
+                    error("Invalid progressive JPEG AC spectral range")
+                end
+                if #scanComponents ~= 1 then
+                    error("Progressive JPEG AC scans must contain exactly one component")
+                end
+            end
+        end
+
+        -- Check that this scan follows the coefficient progression already seen.
+        for _, scanComponent in ipairs(scanComponents) do
+            local component = scanComponent.Component
+            local firstCoefficient = isSequential and 0 or spectralStart
+            local lastCoefficient = isSequential and 63 or spectralEnd
+
+            if not isSequential then
+                if ah == 0 then
+                    for k = firstCoefficient, lastCoefficient do
+                        if component.Progression[k + 1] ~= nil then
+                            error("Progressive JPEG repeats an initial coefficient scan")
+                        end
+                    end
+                else
+                    for k = firstCoefficient, lastCoefficient do
+                        if component.Progression[k + 1] ~= ah then
+                            error("Progressive JPEG refinement scan is out of order")
+                        end
+                    end
+                end
+
+                if spectralStart > 0 and component.Progression[1] == nil then
+                    error("Progressive JPEG AC scan appears before its DC scan")
+                end
+            else
+                if component.SequentialSeen then
+                    error("Sequential JPEG component was scanned more than once")
+                end
+            end
+
+            component.DC = 0
+        end
+
+        -- Only the Huffman table used by the active scan type is required.
+        for _, scanComponent in ipairs(scanComponents) do
+            if isSequential then
+                if not scanComponent.DC or not scanComponent.AC then
+                    error("Sequential JPEG scan references a missing Huffman table")
+                end
+            elseif isDCScan and ah == 0 then
+                if not scanComponent.DC then
+                    error("Progressive DC scan references a missing DC Huffman table")
+                end
+            elseif not isDCScan then
+                if not scanComponent.AC then
+                    error("Progressive AC scan references a missing AC Huffman table")
+                end
+            end
+        end
+
+        local interleaved = #scanComponents > 1
+        local unitsWide
+        local unitsHigh
+        local totalUnits
+
+        if interleaved then
+            unitsWide = mcuColumns
+            unitsHigh = mcuRows
+        else
+            local component = scanComponents[1].Component
+            unitsWide = math.ceil((width * component.H) / (maxH * 8))
+            unitsHigh = math.ceil((height * component.V) / (maxV * 8))
+        end
+
+        totalUnits = unitsWide * unitsHigh
+
+        local ReadBit, ReadBits, ReadHuffman, ConsumeRestart, GetPosition =
+            BuildEntropyReader(entropyStart)
+
+        local eobRun = 0
+        local restartNumber = 0
+        local unitIndex = 0
+        local p1 = 2 ^ al
+
+        local function RefineExistingCoefficient(component, blockIndex, naturalIndex)
+            local coefficient = GetCoefficient(component, blockIndex, naturalIndex)
+            if coefficient ~= 0 then
+                if ReadBit() ~= 0 and bit32.band(coefficient, p1) == 0 then
+                    if coefficient > 0 then
+                        coefficient += p1
+                    else
+                        coefficient -= p1
+                    end
+                    SetCoefficient(component, blockIndex, naturalIndex, coefficient)
+                end
+            end
+        end
+
+        local function DecodeSequentialBlock(component, blockIndex, dcTable, acTable)
+            local dcLength = ReadHuffman(dcTable)
+            if dcLength > 11 then
+                error("Invalid JPEG DC coefficient length")
+            end
+
+            component.DC += JPEGExtend(ReadBits(dcLength), dcLength)
+            SetCoefficient(component, blockIndex, 0, component.DC)
+
+            local k = 1
+            while k <= 63 do
+                local symbol = ReadHuffman(acTable)
+                local run = bit32.rshift(symbol, 4)
+                local size = bit32.band(symbol, 0x0F)
+
+                if size == 0 then
+                    if run == 0 then
+                        break -- End of block.
+                    elseif run == 15 then
+                        k += 16 -- ZRL: sixteen zero AC coefficients.
+                    else
+                        error("Invalid sequential JPEG AC run")
+                    end
+                else
+                    if size > 10 then
+                        error("Invalid sequential JPEG AC coefficient size")
+                    end
+
+                    k += run
+                    if k > 63 then
+                        error("Sequential JPEG AC coefficient exceeds block")
+                    end
+
+                    local value = JPEGExtend(ReadBits(size), size)
+                    SetCoefficient(component, blockIndex, JPEG_ZIGZAG[k + 1], value)
+                    k += 1
+                end
+            end
+        end
+
+        local function DecodeDCFirst(component, blockIndex, dcTable)
+            local dcLength = ReadHuffman(dcTable)
+            if dcLength > 11 then
+                error("Invalid progressive JPEG DC coefficient length")
+            end
+
+            component.DC += JPEGExtend(ReadBits(dcLength), dcLength)
+            SetCoefficient(component, blockIndex, 0, component.DC * p1)
+        end
+
+        local function DecodeDCRefinement(component, blockIndex)
+            if ReadBit() ~= 0 then
+                local value = GetCoefficient(component, blockIndex, 0)
+                -- DC refinement inserts a bit into the signed two's-complement value.
+                if bit32.band(value, p1) == 0 then
+                    SetCoefficient(component, blockIndex, 0, value + p1)
+                end
+            end
+        end
+
+        local function DecodeACFirst(component, blockIndex, acTable)
+            if eobRun > 0 then
+                eobRun -= 1
+                return
+            end
+
+            local k = spectralStart
+            while k <= spectralEnd do
+                local symbol = ReadHuffman(acTable)
+                local run = bit32.rshift(symbol, 4)
+                local size = bit32.band(symbol, 0x0F)
+
+                if size == 0 then
+                    if run == 15 then
+                        k += 16 -- ZRL.
+                    else
+                        eobRun = 2 ^ run + ReadBits(run) - 1
+                        break
+                    end
+                else
+                    if size > 10 then
+                        error("Invalid progressive JPEG AC coefficient size")
+                    end
+
+                    k += run
+                    if k > spectralEnd then
+                        error("Progressive JPEG AC run exceeds spectral band")
+                    end
+
+                    local value = JPEGExtend(ReadBits(size), size) * p1
+                    SetCoefficient(component, blockIndex, JPEG_ZIGZAG[k + 1], value)
+                    k += 1
+                end
+            end
+        end
+
+        local function DecodeACRefinement(component, blockIndex, acTable)
+            local k = spectralStart
+
+            if eobRun == 0 then
+                while k <= spectralEnd do
+                    local symbol = ReadHuffman(acTable)
+                    local run = bit32.rshift(symbol, 4)
+                    local size = bit32.band(symbol, 0x0F)
+                    local newValue = nil
+                    local isZRL = false
+
+                    if size ~= 0 then
+                        if size ~= 1 then
+                            error("Progressive JPEG AC refinement size must be 1")
+                        end
+
+                        newValue = ReadBit() ~= 0 and p1 or -p1
+                    elseif run ~= 15 then
+                        eobRun = 2 ^ run + ReadBits(run)
+                        break
+                    else
+                        -- ZRL skips sixteen zero coefficients, while still
+                        -- consuming correction bits for any existing coefficients.
+                        run = 16
+                        isZRL = true
+                    end
+
+                    while k <= spectralEnd do
+                        local naturalIndex = JPEG_ZIGZAG[k + 1]
+                        local coefficient = GetCoefficient(component, blockIndex, naturalIndex)
+
+                        if coefficient ~= 0 then
+                            RefineExistingCoefficient(component, blockIndex, naturalIndex)
+                            k += 1
+                        else
+                            if run == 0 then
+                                break
+                            end
+
+                            run -= 1
+                            k += 1
+
+                            if isZRL and run == 0 then
+                                break
+                            end
+                        end
+                    end
+
+                    if newValue ~= nil then
+                        if k > spectralEnd then
+                            error("Progressive JPEG refinement run exceeds spectral band")
+                        end
+                        SetCoefficient(component, blockIndex, JPEG_ZIGZAG[k + 1], newValue)
+                        k += 1
+                    end
+                end
+            end
+
+            if eobRun > 0 then
+                -- The remainder of this block is in the current EOB run.
+                while k <= spectralEnd do
+                    RefineExistingCoefficient(component, blockIndex, JPEG_ZIGZAG[k + 1])
+                    k += 1
+                end
+                eobRun -= 1
+            end
+        end
+
+        local function DecodeOneBlock(scanComponent, blockX, blockY)
+            local component = scanComponent.Component
+            if blockX < 0 or blockX >= component.BlocksWide
+                or blockY < 0 or blockY >= component.BlocksHigh then
+                error("JPEG scan addresses a block outside the component plane")
+            end
+
+            local blockIndex = blockY * component.BlocksWide + blockX
+
+            if isSequential then
+                DecodeSequentialBlock(component, blockIndex, scanComponent.DC, scanComponent.AC)
+            elseif isDCScan then
+                if ah == 0 then
+                    DecodeDCFirst(component, blockIndex, scanComponent.DC)
+                else
+                    DecodeDCRefinement(component, blockIndex)
+                end
+            elseif ah == 0 then
+                DecodeACFirst(component, blockIndex, scanComponent.AC)
+            else
+                DecodeACRefinement(component, blockIndex, scanComponent.AC)
+            end
+        end
+
+        for unitY = 0, unitsHigh - 1 do
+            for unitX = 0, unitsWide - 1 do
+                unitIndex += 1
+
+                if interleaved then
+                    for _, scanComponent in ipairs(scanComponents) do
+                        local component = scanComponent.Component
+
+                        for blockY = 0, component.V - 1 do
+                            for blockX = 0, component.H - 1 do
+                                DecodeOneBlock(
+                                    scanComponent,
+                                    unitX * component.H + blockX,
+                                    unitY * component.V + blockY
+                                )
+                            end
+                        end
+                    end
+                else
+                    DecodeOneBlock(scanComponents[1], unitX, unitY)
+                end
+
+                if restartInterval > 0 and unitIndex < totalUnits
+                    and unitIndex % restartInterval == 0 then
+                    ConsumeRestart(0xD0 + restartNumber)
+                    restartNumber = (restartNumber + 1) % 8
+                    eobRun = 0
+
+                    for _, scanComponent in ipairs(scanComponents) do
+                        scanComponent.Component.DC = 0
+                    end
+                end
+
+                if unitIndex % 256 == 0 then
+                    task.wait()
+                end
+            end
+        end
+
+        if eobRun ~= 0 then
+            error("Progressive JPEG EOB run extends beyond its scan")
+        end
+
+        -- The entropy reader leaves its byte position at the next JPEG marker.
+        return GetPosition()
+    end
+
+    while pos <= #data do
+        if data:byte(pos) ~= 0xFF then
+            error("Invalid JPEG marker alignment")
+        end
+
+        while data:byte(pos) == 0xFF do
+            pos += 1
+        end
+
+        local marker = data:byte(pos)
+        pos += 1
+        if marker == nil then
+            error("Unexpected end of JPEG markers")
+        end
+
+        if marker == 0xD9 then -- EOI
+            sawEOI = true
+            break
+        elseif marker == 0xD8 or marker == 0x01 then
+            -- SOI and TEM are standalone markers.
+            continue
+        elseif marker >= 0xD0 and marker <= 0xD7 then
+            error("Unexpected restart marker outside JPEG entropy data")
+        end
+
+        local length = JPEGReadU16(data, pos)
+        if length < 2 or pos + length - 1 > #data then
+            error("Invalid JPEG segment length")
+        end
+
+        local payload = pos + 2
+        local payloadEnd = pos + length - 1
+        local nextSegment = pos + length
+
+        if marker == 0xC0 or marker == 0xC2 then
+            if components then
+                error("JPEG contains multiple frame headers")
+            end
+
+            local precision = data:byte(payload)
+            height = JPEGReadU16(data, payload + 1)
+            width = JPEGReadU16(data, payload + 3)
+            local count = data:byte(payload + 5)
+
+            if precision ~= 8 then
+                error("Only 8-bit JPEG images are supported")
+            end
+            if not width or not height or width < 1 or height < 1 then
+                error("Invalid JPEG dimensions")
+            end
+            if width * height > maxPixels then
+                error("JPEG exceeds the configured pixel limit")
+            end
+            if count ~= 1 and count ~= 3 then
+                error("Only grayscale and three-component JPEGs are supported")
+            end
+            if length ~= 8 + count * 3 then
+                error("Invalid JPEG frame header length")
+            end
+
+            frameMode = marker == 0xC2 and "progressive" or "baseline"
+            components = {}
+            componentByID = {}
+
+            for i = 1, count do
+                local offset = payload + 6 + (i - 1) * 3
+                local id = data:byte(offset)
+                local sampling = data:byte(offset + 1)
+                local quantID = data:byte(offset + 2)
+
+                if componentByID[id] then
+                    error("Duplicate JPEG component identifier")
+                end
+
+                local horizontal = bit32.rshift(sampling, 4)
+                local vertical = bit32.band(sampling, 0x0F)
+                if horizontal < 1 or horizontal > 4 or vertical < 1 or vertical > 4 then
+                    error("Invalid JPEG sampling factors")
+                end
+                if quantID > 3 then
+                    error("Invalid JPEG quantization table selector")
+                end
+
+                local component = {
+                    ID = id,
+                    H = horizontal,
+                    V = vertical,
+                    QuantID = quantID,
+                    DC = 0,
+                }
+
+                components[i] = component
+                componentByID[id] = component
+            end
+
+            InitializeFrame()
+        elseif marker == 0xC1 or marker == 0xC3 or marker == 0xC5 or marker == 0xC6
+            or marker == 0xC7 or marker == 0xC9 or marker == 0xCA or marker == 0xCB
+            or marker == 0xCD or marker == 0xCE or marker == 0xCF then
+            error("Unsupported JPEG frame type; only SOF0 and SOF2 are supported")
+        elseif marker == 0xDB then -- DQT
+            local cursor = payload
+            while cursor <= payloadEnd do
+                local info = data:byte(cursor)
+                if not info then
+                    error("Incomplete JPEG quantization table")
+                end
+                cursor += 1
+
+                local precision = bit32.rshift(info, 4)
+                local tableID = bit32.band(info, 0x0F)
+                if precision ~= 0 then
+                    error("16-bit JPEG quantization tables are not supported")
+                end
+                if tableID > 3 then
+                    error("Invalid JPEG quantization table identifier")
+                end
+
+                local quant = table.create(64)
+                for i = 1, 64 do
+                    local value = data:byte(cursor)
+                    if value == nil or value == 0 then
+                        error("Invalid or incomplete JPEG quantization table")
+                    end
+                    quant[JPEG_ZIGZAG[i] + 1] = value
+                    cursor += 1
+                end
+                quantizationTables[tableID] = quant
+            end
+        elseif marker == 0xC4 then -- DHT
+            local cursor = payload
+            while cursor <= payloadEnd do
+                local info = data:byte(cursor)
+                if not info then
+                    error("Incomplete JPEG Huffman table")
+                end
+                cursor += 1
+
+                local tableClass = bit32.rshift(info, 4)
+                local tableID = bit32.band(info, 0x0F)
+                if tableClass > 1 or tableID > 3 then
+                    error("Invalid JPEG Huffman table selector")
+                end
+
+                local counts = table.create(16)
+                local total = 0
+                for i = 1, 16 do
+                    local count = data:byte(cursor)
+                    if count == nil then
+                        error("Incomplete JPEG Huffman table counts")
+                    end
+                    counts[i] = count
+                    total += count
+                    cursor += 1
+                end
+
+                if cursor + total - 1 > payloadEnd then
+                    error("Incomplete JPEG Huffman symbols")
+                end
+
+                local symbols = table.create(total)
+                for i = 1, total do
+                    symbols[i] = data:byte(cursor)
+                    cursor += 1
+                end
+
+                huffmanTables[tableClass][tableID] = JPEGBuildHuffman(counts, symbols)
+            end
+        elseif marker == 0xDD then -- DRI
+            if length ~= 4 then
+                error("Invalid JPEG restart interval segment")
+            end
+            restartInterval = JPEGReadU16(data, payload)
+        elseif marker == 0xDA then -- SOS
+            if not components then
+                error("JPEG scan appears before its frame header")
+            end
+
+            local count = data:byte(payload)
+            if not count or count < 1 or count > #components then
+                error("Invalid JPEG scan component count")
+            end
+            if length ~= 6 + count * 2 then
+                error("Invalid JPEG scan header length")
+            end
+
+            local scanComponents = {}
+            local seenInScan = {}
+
+            for i = 1, count do
+                local offset = payload + 1 + (i - 1) * 2
+                local id = data:byte(offset)
+                local selector = data:byte(offset + 1)
+                local component = componentByID[id]
+
+                if not component then
+                    error("JPEG scan references an unknown component")
+                end
+                if seenInScan[id] then
+                    error("JPEG scan contains a duplicate component")
+                end
+                seenInScan[id] = true
+
+                local dcID = bit32.rshift(selector, 4)
+                local acID = bit32.band(selector, 0x0F)
+                if dcID > 3 or acID > 3 then
+                    error("Invalid JPEG scan Huffman table selector")
+                end
+
+                scanComponents[i] = {
+                    Component = component,
+                    DC = huffmanTables[0][dcID],
+                    AC = huffmanTables[1][acID],
+                }
+            end
+
+            local spectralStart = data:byte(payload + 1 + count * 2)
+            local spectralEnd = data:byte(payload + 2 + count * 2)
+            local successive = data:byte(payload + 3 + count * 2)
+            local ah = bit32.rshift(successive, 4)
+            local al = bit32.band(successive, 0x0F)
+
+            if spectralStart == nil or spectralEnd == nil or successive == nil then
+                error("Incomplete JPEG scan header")
+            end
+
+            if ah > 13 or al > 13 then
+                error("Invalid JPEG successive-approximation value")
+            end
+
+            local entropyStart = nextSegment
+            pos = DecodeScan(scanComponents, spectralStart, spectralEnd, ah, al, entropyStart)
+            sawScan = true
+
+            -- Record which bit plane is now available for every coefficient
+            -- covered by the completed scan.
+            for _, scanComponent in ipairs(scanComponents) do
+                local component = scanComponent.Component
+                if frameMode == "baseline" then
+                    component.SequentialSeen = true
+                    for k = 0, 63 do
+                        component.Progression[k + 1] = 0
+                    end
+                else
+                    for k = spectralStart, spectralEnd do
+                        component.Progression[k + 1] = al
+                    end
+                end
+            end
+
+            decodedUnits += 1
+            if decodedUnits % 8 == 0 then
+                task.wait()
+            end
+
+            continue
+        end
+
+        pos = nextSegment
+    end
+
+    if not sawEOI then
+        error("JPEG end-of-image marker was not found")
+    end
+    if not sawScan or not components then
+        error("JPEG is missing required frame or scan information")
+    end
+
+    -- Convert the completed coefficient arrays into component sample planes.
+    for _, component in ipairs(components) do
+        local quantization = quantizationTables[component.QuantID]
+        if not quantization then
+            error("JPEG component references a missing quantization table")
+        end
+
+        component.Plane = NewByteArray(component.PlaneWidth * component.PlaneHeight)
+        local processedBlocks = 0
+
+        for blockY = 0, component.BlocksHigh - 1 do
+            for blockX = 0, component.BlocksWide - 1 do
+                local blockIndex = blockY * component.BlocksWide + blockX
+                local coefficients = table.create(64)
+                local base = blockIndex * 64
+
+                for i = 0, 63 do
+                    coefficients[i + 1] = GetInt(component.Coefficients, base + i)
+                end
+
+                local pixels = JPEGIDCT(coefficients, quantization)
+                local startX = blockX * 8
+                local startY = blockY * 8
+
+                for y = 0, 7 do
+                    local destination = (startY + y) * component.PlaneWidth + startX
+                    local source = y * 8
+                    for x = 0, 7 do
+                        SetByte(component.Plane, destination + x, pixels[source + x + 1])
+                    end
+                end
+
+                processedBlocks += 1
+                if processedBlocks % 256 == 0 then
+                    task.wait()
+                end
+            end
+        end
+
+        -- Release the large coefficient buffer/table as soon as IDCT is done.
+        component.Coefficients = nil
+    end
+
+    local yComponent = components[1]
+    local cbComponent = components[2]
+    local crComponent = components[3]
+
+    local function GetPlaneSample(component, x, y)
+        local sampleX = math.floor(x * component.H / maxH)
+        local sampleY = math.floor(y * component.V / maxV)
+        sampleX = math.min(sampleX, component.PlaneWidth - 1)
+        sampleY = math.min(sampleY, component.PlaneHeight - 1)
+        return GetByte(component.Plane, sampleY * component.PlaneWidth + sampleX)
+    end
+
+    local outputChunks = {}
+    local outputChunk = {}
+    local pixelCount = 0
+
+    for y = 0, height - 1 do
+        for x = 0, width - 1 do
+            local red, green, blue
+
+            if #components == 1 then
+                local gray = GetPlaneSample(yComponent, x, y)
+                red, green, blue = gray, gray, gray
+            else
+                local luminance = GetPlaneSample(yComponent, x, y)
+                local cb = GetPlaneSample(cbComponent, x, y) - 128
+                local cr = GetPlaneSample(crComponent, x, y) - 128
+
+                red = JPEGClamp(luminance + 1.402 * cr)
+                green = JPEGClamp(luminance - 0.344136 * cb - 0.714136 * cr)
+                blue = JPEGClamp(luminance + 1.772 * cb)
+            end
+
+            outputChunk[#outputChunk + 1] = red
+            outputChunk[#outputChunk + 1] = green
+            outputChunk[#outputChunk + 1] = blue
+            outputChunk[#outputChunk + 1] = 255
+            pixelCount += 1
+
+            if #outputChunk >= 4096 then
+                outputChunks[#outputChunks + 1] = string.char(table.unpack(outputChunk))
+                table.clear(outputChunk)
+            end
+        end
+
+        if y % 32 == 0 then
+            task.wait()
+        end
+    end
+
+    if #outputChunk > 0 then
+        outputChunks[#outputChunks + 1] = string.char(table.unpack(outputChunk))
+    end
+
+    if pixelCount ~= width * height then
+        error("JPEG decoder produced an incorrect pixel count")
+    end
+
+    return table.concat(outputChunks), width, height
 end
 
 function ImageService:GetImage(url, options): imageData
