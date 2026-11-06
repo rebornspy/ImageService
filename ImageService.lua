@@ -175,6 +175,15 @@ function ImageService:GetImage(url): imageData
     assert(response and response.StatusCode == 200,
         "Image download failed")
 
+    local data = response.Body
+
+	local signature = data:sub(1, 12)
+	
+	print("[ImageService] Downloaded bytes:", #data)
+	print("[ImageService] First 12 bytes:",
+		table.concat({data:byte(1, 12)}, ", ")
+	)
+
 	print("[ImageService] Image HTTP status:", response.StatusCode)
 	print("[ImageService] Content-Type:",
 	    response.Headers and (
@@ -185,15 +194,6 @@ function ImageService:GetImage(url): imageData
 	
 	print("[ImageService] Response preview:")
 	print(response.Body:sub(1, 500))
-
-    local data = response.Body
-
-	local signature = data:sub(1, 12)
-	
-	print("[ImageService] Downloaded bytes:", #data)
-	print("[ImageService] First 12 bytes:",
-		table.concat({data:byte(1, 12)}, ", ")
-	)
 	
 	print("[ImageService] PNG:",
 		data:sub(1, 8) == "\137PNG\r\n\26\n"
