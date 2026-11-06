@@ -227,25 +227,21 @@ local function ReadSubBlocks(data, pos)
 
     while true do
         blockCount += 1
-
         if blockCount % 64 == 0 then
             task.wait()
         end
 
         local size = data:byte(pos)
-
-        if not size then
+        if size == nil then
             error("Unexpected end of GIF sub-blocks")
         end
 
         pos += 1
-
         if size == 0 then
             break
         end
 
         local block = data:sub(pos, pos + size - 1)
-
         if #block ~= size then
             error("Incomplete GIF sub-block")
         end
@@ -261,26 +257,23 @@ end
 
 local function DecodeLZW(data, minimumCodeSize, expectedPixels)
     if minimumCodeSize < 2 or minimumCodeSize > 8 then
-        warn("Invalid GIF LZW minimum code size")
+        error("Invalid GIF LZW minimum code size")
     end
 
     local clearCode = 2 ^ minimumCodeSize
     local endCode = clearCode + 1
-
     local nextCode
     local codeSize
 
     local prefix = {}
     local suffix = {}
-
     local bitPosition = 0
-    local output = {}
-	local processedCodes = 0
+    local output = table.create(expectedPixels)
+    local outputCount = 0
 
     local function ResetDictionary()
         table.clear(prefix)
         table.clear(suffix)
-
         codeSize = minimumCodeSize + 1
         nextCode = endCode + 1
     end
@@ -288,7 +281,6 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
     local function ReadCode()
         local bytePosition = math.floor(bitPosition / 8) + 1
         local shift = bitPosition % 8
-
         local b1 = data:byte(bytePosition) or 0
         local b2 = data:byte(bytePosition + 1) or 0
         local b3 = data:byte(bytePosition + 2) or 0
@@ -297,18 +289,13 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
             return nil
         end
 
-        local combined =
-            b1 +
-            b2 * 256 +
-            b3 * 65536
-
+        local combined = b1 + b2 * 256 + b3 * 65536
         local code = bit32.band(
             bit32.rshift(combined, shift),
             (2 ^ codeSize) - 1
         )
 
         bitPosition += codeSize
-
         return code
     end
 
@@ -318,21 +305,19 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
 
         while code >= clearCode do
             if code >= nextCode then
-                warn("Invalid GIF LZW dictionary reference")
+                error("Invalid GIF LZW dictionary reference")
             end
 
             depth += 1
-
             if depth > 4096 then
-                warn("GIF LZW dictionary cycle detected")
+                error("GIF LZW dictionary cycle detected")
             end
 
             local index = code + 1
             local previous = prefix[index]
             local value = suffix[index]
-
             if previous == nil or value == nil then
-                warn("Invalid GIF LZW dictionary entry")
+                error("Invalid GIF LZW dictionary entry")
             end
 
             stack[#stack + 1] = value
@@ -340,30 +325,39 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
         end
 
         if code < 0 or code >= clearCode then
-            warn("Invalid GIF LZW literal")
+            error("Invalid GIF LZW literal")
         end
 
         stack[#stack + 1] = code
-
         return stack, code
     end
 
-    ResetDictionary()
+    local function AppendPixel(value)
+        outputCount += 1
+        if outputCount > expectedPixels then
+            error("GIF frame exceeds expected dimensions")
+        end
 
+        output[outputCount] = value
+        if outputCount % 8192 == 0 then
+            task.wait()
+        end
+    end
+
+    ResetDictionary()
     local oldCode = nil
     local oldFirst = nil
+    local processedCodes = 0
 
     while true do
-		processedCodes += 1
+        processedCodes += 1
+        if processedCodes % 2048 == 0 then
+            task.wait()
+        end
 
-		if processedCodes % 2048 == 0 then
-			task.wait()
-		end
-
-		local code = ReadCode()
-
+        local code = ReadCode()
         if code == nil then
-            warn("GIF LZW stream ended unexpectedly")
+            error("GIF LZW stream ended unexpectedly")
         end
 
         if code == clearCode then
@@ -382,35 +376,24 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
 
         if code < nextCode then
             stack, first = ExpandCode(code)
-
         elseif code == nextCode and oldCode ~= nil then
             stack = ExpandCode(oldCode)
             first = oldFirst
-
         else
-            warn("Invalid GIF LZW code")
+            error("Invalid GIF LZW code")
         end
 
         for i = #stack, 1, -1 do
-            output[#output + 1] = stack[i]
-
-            if #output > expectedPixels then
-                warn("GIF frame exceeds expected dimensions")
-            end
+            AppendPixel(stack[i])
         end
 
         if code == nextCode and oldCode ~= nil then
-            output[#output + 1] = first
-
-            if #output > expectedPixels then
-                warn("GIF frame exceeds expected dimensions")
-            end
+            AppendPixel(first)
         end
 
         if oldCode ~= nil and nextCode < 4096 then
             prefix[nextCode + 1] = oldCode
             suffix[nextCode + 1] = first
-
             nextCode += 1
 
             if nextCode == 2 ^ codeSize and codeSize < 12 then
@@ -421,16 +404,17 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
         oldCode = code
         oldFirst = first
 
-        if #output == expectedPixels then
+        if outputCount == expectedPixels then
             break
         end
     end
 
-    if #output ~= expectedPixels then
-        warn("GIF frame contains an incorrect pixel count")
+    if outputCount ~= expectedPixels then
+        error("GIF frame contains an incorrect pixel count")
     end
 
     return output
+
 end
 
 --// INTERLACE DECODER
@@ -507,6 +491,7 @@ local function DrawGIFFrame(
     end
 
     local pixelIndex = 1
+    local processedPixels = 0
 
     for _, sourceY in ipairs(rows) do
         local destinationY = frame.Top + sourceY
@@ -514,6 +499,11 @@ local function DrawGIFFrame(
         for x = 0, frame.Width - 1 do
             local paletteIndex = frame.Pixels[pixelIndex]
             pixelIndex += 1
+            processedPixels += 1
+
+            if processedPixels % 16384 == 0 then
+                task.wait()
+            end
 
             if paletteIndex == nil then
                 warn("Missing GIF frame pixel")
@@ -548,16 +538,37 @@ end
 
 --// CONVERT CANVAS TO RGBA BINARY STRING
 
-local function CanvasToRGBA(canvas)
+local function CanvasToRGBA(canvas, sourceWidth, sourceHeight, outputWidth, outputHeight)
+    outputWidth = outputWidth or sourceWidth
+    outputHeight = outputHeight or sourceHeight
+
     local chunks = {}
     local chunk = {}
+    local processedPixels = 0
+    local scaleX = sourceWidth / outputWidth
+    local scaleY = sourceHeight / outputHeight
 
-    for i = 1, #canvas do
-        chunk[#chunk + 1] = canvas[i]
+    for y = 0, outputHeight - 1 do
+        local sourceY = math.min(sourceHeight - 1, math.floor(y * scaleY))
 
-        if #chunk >= 4096 then
-            chunks[#chunks + 1] = string.char(table.unpack(chunk))
-            table.clear(chunk)
+        for x = 0, outputWidth - 1 do
+            local sourceX = math.min(sourceWidth - 1, math.floor(x * scaleX))
+            local sourceIndex = (sourceY * sourceWidth + sourceX) * 4 + 1
+
+            chunk[#chunk + 1] = canvas[sourceIndex]
+            chunk[#chunk + 1] = canvas[sourceIndex + 1]
+            chunk[#chunk + 1] = canvas[sourceIndex + 2]
+            chunk[#chunk + 1] = canvas[sourceIndex + 3]
+            processedPixels += 1
+
+            if #chunk >= 4096 then
+                chunks[#chunks + 1] = string.char(table.unpack(chunk))
+                table.clear(chunk)
+            end
+
+            if processedPixels % 8192 == 0 then
+                task.wait()
+            end
         end
     end
 
@@ -575,6 +586,11 @@ function ImageService:DecodeGIF(data, limits)
 
     local MAX_PIXELS = limits.MaxPixels or 4000000
     local MAX_FRAMES = limits.MaxFrames or 500
+    local outputScale = limits.Scale or 1
+
+    if type(outputScale) ~= "number" or outputScale <= 0 or outputScale > 1 then
+        return nil, "Scale must be a number greater than 0 and at most 1"
+    end
 
     local success, result = pcall(function()
         if #data < 13 then
@@ -597,6 +613,8 @@ function ImageService:DecodeGIF(data, limits)
         end
 
         local totalPixels = width * height
+        local outputWidth = math.max(1, math.floor(width * outputScale + 0.5))
+        local outputHeight = math.max(1, math.floor(height * outputScale + 0.5))
 
         if totalPixels > MAX_PIXELS then
             warn("GIF exceeds maximum canvas dimensions")
@@ -857,10 +875,16 @@ function ImageService:DecodeGIF(data, limits)
                 )
 
                 frames[#frames + 1] = {
-                    Data = CanvasToRGBA(canvas),
+                    Data = CanvasToRGBA(
+                        canvas,
+                        width,
+                        height,
+                        outputWidth,
+                        outputHeight
+                    ),
 
-                    Width = width,
-                    Height = height,
+                    Width = outputWidth,
+                    Height = outputHeight,
 
                     Delay = frame.Delay,
                     Disposal = frame.Disposal,
@@ -890,8 +914,11 @@ function ImageService:DecodeGIF(data, limits)
         end
 
         return {
-            Width = width,
-            Height = height,
+            Width = outputWidth,
+            Height = outputHeight,
+            OriginalWidth = width,
+            OriginalHeight = height,
+            Scale = outputScale,
 
             Frames = frames,
             FrameCount = #frames,
@@ -911,33 +938,21 @@ end
 
 --// DOWNLOAD AND DECODE GIF
 
-function ImageService:GetGIF(url)
-    warn("[GIF] Sending HTTP request...")
+function ImageService:GetGIF(url, limits)
+    local response = request({
+        Url = url,
+        Method = "GET"
+    })
 
-    local requestSuccess, response = pcall(function()
-        return request({
-            Url = url,
-            Method = "GET"
-        })
-    end)
-
-    if not requestSuccess then
-        return nil, "HTTP request failed: " .. tostring(response)
+    if not response or not response.Body then
+        return nil, "Empty HTTP response"
     end
 
-    warn("[GIF] HTTP request returned")
-
-    if not response or type(response.Body) ~= "string" then
-        return nil, "Empty or invalid HTTP response"
+    if response.StatusCode < 200 or response.StatusCode >= 300 then
+        return nil, "HTTP warn: " .. tostring(response.StatusCode)
     end
 
-    warn("[GIF] Downloaded bytes:", #response.Body)
-    warn("[GIF] Signature:", response.Body:sub(1, 6))
-    warn("[GIF] Starting decoder...")
-
-    local animation, err = self:DecodeGIF(response.Body)
-
-    warn("[GIF] Decoder finished")
+    local animation, err = self:DecodeGIF(response.Body, limits)
 
     if not animation then
         return nil, err
@@ -945,101 +960,208 @@ function ImageService:GetGIF(url)
 
     animation.StatusCode = response.StatusCode
 
-    warn("[GIF] Frames decoded:", animation.FrameCount)
-
     return animation
 end
 
 --// GIF ANIMATION PLAYER
 
+-- PrepareGIF intentionally does NOT encode every frame. It keeps references
+-- to the decoded RGBA frames and lets PlayGIF encode only a small rolling cache.
 function ImageService:PrepareGIF(animation)
     assert(animation and animation.Frames, "Invalid GIF animation")
+    assert(#animation.Frames > 0, "GIF contains no frames")
 
-    local prepared = {
-        Frames = {},
+    return {
+        Frames = animation.Frames, -- Shared reference; no duplicate frame table/data.
         Width = animation.Width,
         Height = animation.Height,
-        LoopCount = animation.LoopCount
+        OriginalWidth = animation.OriginalWidth or animation.Width,
+        OriginalHeight = animation.OriginalHeight or animation.Height,
+        LoopCount = animation.LoopCount,
+        FrameCount = animation.FrameCount or #animation.Frames,
+        Format = animation.Format or "RGBA8",
+        IsPrepared = true
     }
-
-    for i, frame in ipairs(animation.Frames) do
-        local png, err = self:EncodePNG(
-            frame.Data,
-            frame.Width or animation.Width,
-            frame.Height or animation.Height
-        )
-
-        if not png then
-            error("Failed to encode GIF frame " .. i .. ": " .. tostring(err))
-        end
-
-        prepared.Frames[i] = {
-            Data = png,
-            Delay = math.max(frame.Delay or 0.1, 0.02)
-        }
-    end
-
-    return prepared
 end
 
-function ImageService:PlayGIF(animation, image)
-    assert(animation and animation.Frames, "Invalid animation")
+-- options:
+--   CacheFrames: number of encoded PNG frames to retain (default 2, max 8)
+--   MaxFPS: optional playback FPS cap (e.g. 24 or 30)
+--   MinDelay: minimum delay between frames (default 1/60 second)
+function ImageService:PlayGIF(animation, image, options)
+    options = options or {}
+
+    assert(animation and animation.Frames, "Invalid GIF animation")
     assert(image, "Missing Drawing image")
 
     local frames = animation.Frames
     local frameCount = #frames
-
     assert(frameCount > 0, "GIF contains no frames")
 
-    local playback = {
-        Running = true
-    }
+    local cacheLimit = math.floor(tonumber(options.CacheFrames) or 2)
+    cacheLimit = math.clamp(cacheLimit, 2, 8)
+
+    local minDelay = tonumber(options.MinDelay) or (1 / 60)
+    minDelay = math.max(minDelay, 0.001)
+
+    local maxFPS = tonumber(options.MaxFPS)
+    if maxFPS and maxFPS <= 0 then
+        maxFPS = nil
+    end
+
+    local playback = { Running = true }
+    local pngCache = {}
+    local pending = {}
+    local failures = {}
+    local activeIndex = nil
+
+    local function trimCache(newIndex)
+        local count = 0
+        for _ in pairs(pngCache) do
+            count += 1
+        end
+
+        while count > cacheLimit do
+            local removed = false
+            for cachedIndex in pairs(pngCache) do
+                if cachedIndex ~= activeIndex and cachedIndex ~= newIndex then
+                    pngCache[cachedIndex] = nil
+                    count -= 1
+                    removed = true
+                    break
+                end
+            end
+            if not removed then
+                break
+            end
+        end
+    end
+
+    local function requestEncode(index)
+        if pngCache[index] or pending[index] or failures[index] then
+            return
+        end
+
+        pending[index] = true
+
+        task.spawn(function()
+            local frame = frames[index]
+            local ok, png, encodeError = pcall(function()
+                return self:EncodePNG(
+                    frame.Data,
+                    frame.Width or animation.Width,
+                    frame.Height or animation.Height
+                )
+            end)
+
+            pending[index] = nil
+
+            if not playback.Running then
+                return
+            end
+
+            if not ok then
+                failures[index] = tostring(png)
+                warn("GIF frame " .. index .. " encoding failed:", png)
+                return
+            end
+
+            if not png then
+                failures[index] = tostring(encodeError or "PNG encoder returned nil")
+                warn("GIF frame " .. index .. " encoding failed:", failures[index])
+                return
+            end
+
+            pngCache[index] = png
+            trimCache(index)
+        end)
+    end
+
+    local function waitForEncoded(index)
+        requestEncode(index)
+
+        while playback.Running and not pngCache[index] and not failures[index] do
+            task.wait()
+        end
+
+        return pngCache[index], failures[index]
+    end
 
     task.spawn(function()
         local index = 1
-        local loops = 0
+        local completedPlays = 0
+        local loopCount = animation.LoopCount
+
+        -- No NETSCAPE loop extension means play once. A loop count of zero
+        -- means infinite; a positive count is the number of repeats after
+        -- the initial play.
+        local function hasMorePlays()
+            if loopCount == nil then
+                return false
+            end
+            if loopCount == 0 then
+                return true
+            end
+            return completedPlays <= loopCount
+        end
 
         while playback.Running do
-            local frame = frames[index]
-
-            if not frame then
-                break
-            end
-
-            local success, err = pcall(function()
-                image.Data = frame.Data
-            end)
-
-            if not success then
-                warn("GIF playback error:", err)
-                break
-            end
-
-            task.wait(frame.Delay)
-
+            local png, encodeError = waitForEncoded(index)
             if not playback.Running then
                 break
             end
 
-            index += 1
+            if not png then
+                warn("GIF playback stopped:", encodeError)
+                break
+            end
 
-            if index > frameCount then
-                index = 1
-                loops += 1
+            local assigned, assignError = pcall(function()
+                image.Data = png
+            end)
 
-                if animation.LoopCount
-                    and animation.LoopCount > 0
-                    and loops >= animation.LoopCount then
+            if not assigned then
+                warn("GIF playback image update failed:", assignError)
+                break
+            end
+
+            activeIndex = index
+
+            local frame = frames[index]
+            local delay = tonumber(frame.Delay) or 0.1
+            if delay <= 0 then
+                delay = 0.1
+            end
+            delay = math.max(delay, minDelay)
+            if maxFPS then
+                delay = math.max(delay, 1 / maxFPS)
+            end
+
+            local nextIndex = index + 1
+            if nextIndex > frameCount then
+                completedPlays += 1
+                if not hasMorePlays() then
                     break
                 end
+                nextIndex = 1
             end
+
+            -- Encode the next frame while the current one is on screen.
+            requestEncode(nextIndex)
+            task.wait(delay)
+            index = nextIndex
         end
 
         playback.Running = false
+        table.clear(pending)
+        table.clear(pngCache)
+        table.clear(failures)
     end)
 
     return function()
         playback.Running = false
+        table.clear(pngCache)
+        table.clear(failures)
     end
 end
 
@@ -1084,6 +1206,10 @@ local function CRC32(data)
     local crc = 0xFFFFFFFF
 
     for i = 1, #data do
+        if i % 65536 == 0 then
+            task.wait()
+        end
+
         local index = bit32.band(
             bit32.bxor(crc, data:byte(i)),
             0xFF
@@ -1107,6 +1233,10 @@ local function Adler32(data)
     local MOD = 65521
 
     for i = 1, #data do
+        if i % 65536 == 0 then
+            task.wait()
+        end
+
         a = (a + data:byte(i)) % MOD
         b = (b + a) % MOD
     end
@@ -1138,8 +1268,14 @@ local function ZlibStore(data)
 
     local pos = 1
     local length = #data
+    local blockCount = 0
 
-    while (pos <= length) and task.wait() do
+    while pos <= length do
+        blockCount += 1
+        if blockCount % 4 == 0 then
+            task.wait()
+        end
+
         local blockSize = math.min(
             65535,
             length - pos + 1
@@ -1300,19 +1436,19 @@ FUNCTIONS:
         - Supports optional limits to help control frame count
           and image dimensions.
 
-    * GetGIF(url)
+    * GetGIF(url, limits)
         - Downloads GIF data from the given URL.
-        - Passes the downloaded data to DecodeGIF.
+        - Passes optional decoding limits (including Scale) to DecodeGIF.
         - Returns the decoded animation information.
 
     GIF PLAYBACK:
-    * PlayGIF(animation, image, encodeFrame)
+    * PlayGIF(animation, image, options)
         - Plays a decoded GIF using an existing Drawing image.
-        - Updates the image with each animation frame.
-        - Uses the frame delays and looping information.
-        - Accepts an encodeFrame callback to convert each RGBA
-          frame into a format supported by the Drawing image.
-        - Returns a function that can be called to stop playback.
+        - Encodes frames just before they are needed and prefetches
+          the next frame while the current frame is displayed.
+        - Keeps only a small rolling PNG cache to reduce memory use.
+        - Supports CacheFrames, MaxFPS, and MinDelay options.
+        - Returns a function that stops playback.
 
     PNG ENCODING:
     * EncodePNG(rgba, width, height)
@@ -1334,25 +1470,37 @@ USAGE:
         "https://static.wikia.nocookie.net/charlie-the-steak/images/c/c9/Charlie.png"
     )
 
-    -- Decode a GIF:
-    local animation = ImageService:GetGIF("https://example.com/animation.gif")
-
-    -- Play the GIF using an existing Drawing image:
-    local stopPlayback = ImageService:PlayGIF(
-        animation,
-        image,
-        function(rgba, width, height)
-            return ImageService:EncodePNG(rgba, width, height)
-        end
+    -- Decode at half resolution to reduce RGBA memory by about 75%:
+    local animation = ImageService:GetGIF(
+        "https://example.com/animation.gif",
+        { Scale = 0.5, MaxFrames = 300, MaxPixels = 4000000 }
     )
+
+    -- PrepareGIF now retains references; it does not encode every frame:
+    local prepared = ImageService:PrepareGIF(animation)
+
+    -- Keep only two encoded PNG frames and cap playback at 24 FPS:
+    local image = Drawing.new("Image")
+    image.Size = Vector2.new(300, 200)
+    image.Position = Vector2.new(100, 100)
+    image.Visible = true
+
+    local stopPlayback = ImageService:PlayGIF(prepared, image, {
+        CacheFrames = 2,
+        MaxFPS = 24,
+        MinDelay = 1 / 30
+    })
 
     -- Stop GIF playback:
     stopPlayback()
 
 NOTES:
     * GIF decoding and PNG encoding operate on binary image data.
-    * GIF playback requires a Drawing image object and an encoder
-      callback that returns image data supported by the Drawing API.
+    * GetGIF accepts Scale between 0 and 1. Lower values reduce the
+      stored RGBA frame dimensions and memory footprint.
+    * PrepareGIF does not duplicate or PNG-encode all decoded frames.
+    * PlayGIF lazily encodes frames, prefetches one frame ahead, and
+      retains only a bounded cache of encoded PNG frames.
     * The PNG encoder currently uses uncompressed DEFLATE blocks.
       This produces valid PNG structure but larger files than
       compressed PNG encoders.
