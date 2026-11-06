@@ -166,112 +166,115 @@ export type imageData = {
 	StatusCode: number,
 }
 
+
 function ImageService:GetImage(url): imageData
-    local response = request({
-	    Url = url,
-	    Method = "GET",
-	    Headers = {
-	        ["User-Agent"] = "Mozilla/5.0",
-	        ["Referer"] = "https://gelbooru.com/",
-	        ["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-	    }
-	})
+	assert(type(url) == "string" and url ~= "", "Invalid image URL")
 
-    assert(response and response.StatusCode == 200,
-        "Image download failed")
+	local function Download(requestURL, referer)
+		local success, response = pcall(function()
+			return request({
+				Url = requestURL,
+				Method = "GET",
+				Headers = {
+					["User-Agent"] = "Mozilla/5.0",
+					["Referer"] = referer or "https://gelbooru.com/",
+					["Accept"] = "image/png,image/jpeg,image/webp,*/*;q=0.8",
+				},
+			})
+		end)
 
-    local data = response.Body
+		if not success then
+			return nil, tostring(response)
+		end
 
-	local signature = data:sub(1, 12)
-	
-	print("[ImageService] Downloaded bytes:", #data)
-	print("[ImageService] First 12 bytes:",
-		table.concat({data:byte(1, 12)}, ", ")
-	)
+		if type(response) ~= "table" then
+			return nil, "Invalid HTTP response"
+		end
 
-	print("[ImageService] Image HTTP status:", response.StatusCode)
-	print("[ImageService] Content-Type:",
-	    response.Headers and (
-	        response.Headers["Content-Type"]
-	        or response.Headers["content-type"]
-	    )
-	)
-	
-	print("[ImageService] Response preview:")
-	print(response.Body:sub(1, 500))
-	
-	print("[ImageService] PNG:",
-		data:sub(1, 8) == "\137PNG\r\n\26\n"
-	)
-	
-	print("[ImageService] JPEG:",
-		data:byte(1) == 0xFF and data:byte(2) == 0xD8
-	)
-	
-	print("[ImageService] WebP:",
-		data:sub(1, 4) == "RIFF"
+		if response.StatusCode ~= 200 then
+			return nil, "HTTP status " .. tostring(response.StatusCode)
+		end
+
+		if type(response.Body) ~= "string" or #response.Body == 0 then
+			return nil, "Empty response body"
+		end
+
+		return response
+	end
+
+	local response, downloadError = Download(url)
+
+	if not response then
+		error("Image download failed: " .. tostring(downloadError))
+	end
+
+	local data = response.Body
+
+	local isPNG = data:sub(1, 8) == "\137PNG\r\n\26\n"
+	local isJPEG = data:byte(1) == 0xFF and data:byte(2) == 0xD8
+	local isWebP = data:sub(1, 4) == "RIFF"
 		and data:sub(9, 12) == "WEBP"
-	)
 
-    assert(type(data) == "string" and #data > 0,
-        "Empty image response")
+	if not isPNG and not isJPEG and not isWebP then
+		error("Unsupported image data returned by server")
+	end
 
-    local isJPEG =
-        data:byte(1) == 0xFF
-        and data:byte(2) == 0xD8
+	if isJPEG then
+		local encodedURL = game:GetService("HttpService"):UrlEncode(url)
 
-    if isJPEG then
-        print("[ImageService]: Converting JPEG to PNG...")
+		local conversionURLs = {
+			"https://wsrv.nl/?url=" .. encodedURL .. "&output=png",
+			"https://images.weserv.nl/?url=" .. encodedURL .. "&output=png",
+		}
 
-        local encodedURL = game.HttpService:UrlEncode(url)
+		local conversionErrors = {}
 
-        local conversionURL =
-            "https://images.weserv.nl/?url="
-            .. encodedURL
-            .. "&output=png"
+		local convertedData
 
-        local converted = request({
-            Url = conversionURL,
-            Method = "GET",
-        })
-
-        assert(converted and converted.StatusCode == 200,
-            "JPEG conversion failed")
-
-        data = converted.Body
-
-		print("[ImageService] Conversion status:", converted.StatusCode)
-		print("[ImageService] Response size:", #data)
-		print("[ImageService] Content-Type:",
-			converted.Headers and (
-				converted.Headers["Content-Type"]
-				or converted.Headers["content-type"]
+		for _, conversionURL in ipairs(conversionURLs) do
+			local converted, conversionError = Download(
+				conversionURL,
+				"https://gelbooru.com/"
 			)
-		)
-		
-		print("[ImageService] First 16 bytes:", data:sub(1, 16):byte(1, 16))
-		print("[ImageService] PNG signature:", data:sub(1, 8) == "\137PNG\r\n\26\n")
-		print("[ImageService] JPEG signature:",
-			data:byte(1) == 0xFF and data:byte(2) == 0xD8
-		)
 
-        assert(
-            data:sub(1, 8) == "\137PNG\r\n\26\n",
-            "Conversion service did not return PNG data"
-        )
-    end
+			if converted then
+				local convertedBody = converted.Body
 
-    local width, height = GetSizeFromBytes(data)
+				if convertedBody:sub(1, 8) == "\137PNG\r\n\26\n" then
+					convertedData = convertedBody
+					break
+				else
+					conversionErrors[#conversionErrors + 1] =
+						"Converter returned unsupported data"
+				end
+			else
+				conversionErrors[#conversionErrors + 1] =
+					tostring(conversionError)
+			end
+		end
 
-    assert(width and height,
-        "Could not determine image dimensions")
+		if not convertedData then
+			error(
+				"JPEG conversion failed: "
+				.. table.concat(conversionErrors, "; ")
+			)
+		end
 
-    return {
-        Data = data,
-        Width = width,
-        Height = height,
-        StatusCode = response.StatusCode,
-    }
+		data = convertedData
+	end
+
+	local width, height, sizeError = GetSizeFromBytes(data)
+
+	if not width or not height then
+		error("Could not determine image dimensions: " .. tostring(sizeError))
+	end
+
+	return {
+		Data = data,
+		Width = width,
+		Height = height,
+		StatusCode = response.StatusCode,
+	}
 end
 
 function ImageService:CalculateNewSize(width, height, targetWidth): Vector2
