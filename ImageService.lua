@@ -177,28 +177,6 @@ function ImageService:GetImage(url): imageData
 	    }
 	})
 
-	local body = imageResponse.Body
-
-	print("[Image Debug] Status:", imageResponse.StatusCode)
-	print("[Image Debug] Content-Type:",
-	    imageResponse.Headers and imageResponse.Headers["Content-Type"]
-	)
-	
-	for _, keyword in ipairs({
-	    "og:image",
-	    "file_url",
-	    "403",
-	    "Cloudflare",
-	    "Access Denied",
-	    "captcha",
-	    "login"
-	}) do
-	    print(
-	        "[Image Debug] " .. keyword .. ":",
-	        body:find(keyword, 1, true) ~= nil
-	    )
-	end
-
     assert(response and response.StatusCode == 200,
         "Image download failed")
 
