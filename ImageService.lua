@@ -166,107 +166,726 @@ export type imageData = {
 	StatusCode: number,
 }
 
+--// BASELINE JPEG DECODER
+-- Supports 8-bit SOF0 JPEG, grayscale, and 3-component YCbCr.
+-- Supports common chroma subsampling: 4:4:4, 4:2:2, and 4:2:0.
 
-function ImageService:GetImage(url): imageData
-	assert(type(url) == "string" and url ~= "", "Invalid image URL")
+local JPEG_ZIGZAG = {
+	0, 1, 8, 16, 9, 2, 3, 10,
+	17, 24, 32, 25, 18, 11, 4, 5,
+	12, 19, 26, 33, 40, 48, 41, 34,
+	27, 20, 13, 6, 7, 14, 21, 28,
+	35, 42, 49, 56, 57, 50, 43, 36,
+	29, 22, 15, 23, 30, 37, 44, 51,
+	58, 59, 52, 45, 38, 31, 39, 46,
+	53, 60, 61, 54, 47, 55, 62, 63,
+}
 
-	local function Download(requestURL, referer)
-		local success, response = pcall(function()
-			return request({
-				Url = requestURL,
-				Method = "GET",
-				Headers = {
-					["User-Agent"] = "Mozilla/5.0",
-					["Referer"] = referer or "https://gelbooru.com/",
-					["Accept"] = "image/png,image/jpeg,image/webp,*/*;q=0.8",
-				},
-			})
-		end)
+local JPEG_COS = table.create(8)
+local JPEG_C = { 1 / math.sqrt(2), 1, 1, 1, 1, 1, 1, 1 }
 
-		if not success then
-			return nil, tostring(response)
-		end
+for x = 0, 7 do
+	JPEG_COS[x + 1] = table.create(8)
 
-		if type(response) ~= "table" then
-			return nil, "Invalid HTTP response"
-		end
+	for u = 0, 7 do
+		JPEG_COS[x + 1][u + 1] =
+			math.cos(((2 * x + 1) * u * math.pi) / 16)
+	end
+end
 
-		if response.StatusCode ~= 200 then
-			return nil, "HTTP status " .. tostring(response.StatusCode)
-		end
+local function JPEGClamp(value)
+	return math.max(0, math.min(255, math.floor(value + 0.5)))
+end
 
-		if type(response.Body) ~= "string" or #response.Body == 0 then
-			return nil, "Empty response body"
-		end
+local function JPEGReadU16(data, pos)
+	local a, b = data:byte(pos, pos + 1)
 
-		return response
+	if not a or not b then
+		error("Unexpected end of JPEG data")
 	end
 
-	local response, downloadError = Download(url)
+	return a * 256 + b
+end
 
-	if not response then
-		error("Image download failed: " .. tostring(downloadError))
+local function JPEGBuildHuffman(counts, symbols)
+	local tableByLength = {}
+	local code = 0
+	local symbolIndex = 1
+
+	for length = 1, 16 do
+		local count = counts[length]
+
+		if count > 0 then
+			local entries = {}
+
+			for _ = 1, count do
+				local symbol = symbols[symbolIndex]
+
+				if symbol == nil then
+					error("Incomplete JPEG Huffman table")
+				end
+
+				entries[code] = symbol
+				code += 1
+				symbolIndex += 1
+			end
+
+			tableByLength[length] = entries
+		end
+
+		code *= 2
+	end
+
+	return tableByLength
+end
+
+local function JPEGExtend(value, bitCount)
+	if bitCount == 0 then
+		return 0
+	end
+
+	local threshold = 2 ^ (bitCount - 1)
+
+	if value < threshold then
+		return value - (2 ^ bitCount) + 1
+	end
+
+	return value
+end
+
+local function JPEGIDCT(coefficients, quantization)
+	local temporary = table.create(64)
+
+	for v = 0, 7 do
+		for x = 0, 7 do
+			local sum = 0
+
+			for u = 0, 7 do
+				local index = v * 8 + u + 1
+				local value = coefficients[index] * quantization[index]
+
+				sum += JPEG_C[u + 1] * value * JPEG_COS[x + 1][u + 1]
+			end
+
+			temporary[v * 8 + x + 1] = sum
+		end
+	end
+
+	local output = table.create(64)
+
+	for y = 0, 7 do
+		for x = 0, 7 do
+			local sum = 0
+
+			for v = 0, 7 do
+				sum += JPEG_C[v + 1]
+					* temporary[v * 8 + x + 1]
+					* JPEG_COS[y + 1][v + 1]
+			end
+
+			output[y * 8 + x + 1] = JPEGClamp(sum / 4 + 128)
+		end
+	end
+
+	return output
+end
+
+local function DecodeJPEG(data, options)
+	options = options or {}
+
+	assert(type(data) == "string", "JPEG data must be a string")
+	assert(data:byte(1) == 0xFF and data:byte(2) == 0xD8, "Invalid JPEG signature")
+
+	local maxPixels = tonumber(options.MaxPixels) or 8000000
+	local pos = 3
+
+	local width
+	local height
+	local components
+	local componentByID = {}
+
+	local quantizationTables = {}
+	local huffmanTables = {
+		[0] = {},
+		[1] = {},
+	}
+
+	local restartInterval = 0
+	local scanComponents
+	local scanPosition
+
+	while pos <= #data do
+		if data:byte(pos) ~= 0xFF then
+			error("Invalid JPEG marker alignment")
+		end
+
+		while data:byte(pos) == 0xFF do
+			pos += 1
+		end
+
+		local marker = data:byte(pos)
+		pos += 1
+
+		if not marker then
+			error("Unexpected end of JPEG markers")
+		end
+
+		if marker == 0xD9 then
+			error("JPEG ended before its scan")
+		elseif marker == 0xDA then
+			local length = JPEGReadU16(data, pos)
+			local payload = pos + 2
+			local count = data:byte(payload)
+
+			if not count or count < 1 then
+				error("Invalid JPEG scan header")
+			end
+
+			scanComponents = {}
+
+			for i = 1, count do
+				local offset = payload + 1 + (i - 1) * 2
+				local id = data:byte(offset)
+				local selector = data:byte(offset + 1)
+
+				local component = componentByID[id]
+				if not component then
+					error("JPEG scan references an unknown component")
+				end
+
+				local dcID = bit32.rshift(selector, 4)
+				local acID = bit32.band(selector, 0x0F)
+
+				scanComponents[i] = {
+					Component = component,
+					DC = huffmanTables[0][dcID],
+					AC = huffmanTables[1][acID],
+				}
+
+				if not scanComponents[i].DC or not scanComponents[i].AC then
+					error("JPEG scan references a missing Huffman table")
+				end
+			end
+
+			local spectralStart = data:byte(payload + 1 + count * 2)
+			local spectralEnd = data:byte(payload + 2 + count * 2)
+			local successive = data:byte(payload + 3 + count * 2)
+
+			if spectralStart ~= 0 or spectralEnd ~= 63 or successive ~= 0 then
+				error("Unsupported JPEG scan mode; baseline sequential scans are required")
+			end
+
+			if length < 6 + count * 2 then
+				error("Invalid JPEG scan segment length")
+			end
+
+			scanPosition = pos + length
+			break
+		else
+			if marker == 0xD8 or marker == 0x01
+				or (marker >= 0xD0 and marker <= 0xD7) then
+				continue
+			end
+
+			local length = JPEGReadU16(data, pos)
+
+			if length < 2 or pos + length - 1 > #data then
+				error("Invalid JPEG segment length")
+			end
+
+			local payload = pos + 2
+			local payloadEnd = pos + length - 1
+
+			if marker == 0xC0 then
+				local precision = data:byte(payload)
+				height = JPEGReadU16(data, payload + 1)
+				width = JPEGReadU16(data, payload + 3)
+
+				local count = data:byte(payload + 5)
+
+				if precision ~= 8 then
+					error("Only 8-bit JPEG images are supported")
+				end
+
+				if not width or not height or width < 1 or height < 1 then
+					error("Invalid JPEG dimensions")
+				end
+
+				if width * height > maxPixels then
+					error("JPEG exceeds the configured pixel limit")
+				end
+
+				if count ~= 1 and count ~= 3 then
+					error("Only grayscale and three-component JPEGs are supported")
+				end
+
+				components = {}
+				componentByID = {}
+
+				for i = 1, count do
+					local offset = payload + 6 + (i - 1) * 3
+					local id = data:byte(offset)
+					local sampling = data:byte(offset + 1)
+					local quantID = data:byte(offset + 2)
+
+					local horizontal = bit32.rshift(sampling, 4)
+					local vertical = bit32.band(sampling, 0x0F)
+
+					if horizontal < 1 or horizontal > 4
+						or vertical < 1 or vertical > 4 then
+						error("Invalid JPEG sampling factors")
+					end
+
+					local component = {
+						ID = id,
+						H = horizontal,
+						V = vertical,
+						QuantID = quantID,
+						DC = 0,
+					}
+
+					components[i] = component
+					componentByID[id] = component
+				end
+			elseif marker == 0xC2 then
+				error("Progressive JPEG is not supported yet")
+			elseif marker == 0xDB then
+				local cursor = payload
+
+				while cursor <= payloadEnd do
+					local info = data:byte(cursor)
+					cursor += 1
+
+					local precision = bit32.rshift(info, 4)
+					local tableID = bit32.band(info, 0x0F)
+
+					if precision ~= 0 then
+						error("16-bit JPEG quantization tables are not supported")
+					end
+
+					local quant = table.create(64)
+
+					for i = 1, 64 do
+						local value = data:byte(cursor)
+
+						if not value then
+							error("Incomplete JPEG quantization table")
+						end
+
+						quant[JPEG_ZIGZAG[i] + 1] = value
+						cursor += 1
+					end
+
+					quantizationTables[tableID] = quant
+				end
+			elseif marker == 0xC4 then
+				local cursor = payload
+
+				while cursor <= payloadEnd do
+					local info = data:byte(cursor)
+					cursor += 1
+
+					local tableClass = bit32.rshift(info, 4)
+					local tableID = bit32.band(info, 0x0F)
+
+					if tableClass > 1 then
+						error("Invalid JPEG Huffman table class")
+					end
+
+					local counts = table.create(16)
+					local total = 0
+
+					for i = 1, 16 do
+						local count = data:byte(cursor)
+
+						if count == nil then
+							error("Incomplete JPEG Huffman table")
+						end
+
+						counts[i] = count
+						total += count
+						cursor += 1
+					end
+
+					local symbols = table.create(total)
+
+					for i = 1, total do
+						symbols[i] = data:byte(cursor)
+
+						if symbols[i] == nil then
+							error("Incomplete JPEG Huffman symbols")
+						end
+
+						cursor += 1
+					end
+
+					huffmanTables[tableClass][tableID] =
+						JPEGBuildHuffman(counts, symbols)
+				end
+			elseif marker == 0xDD then
+				restartInterval = JPEGReadU16(data, payload)
+			end
+
+			pos += length
+		end
+	end
+
+	if not scanPosition or not width or not height or not components then
+		error("JPEG is missing required frame or scan information")
+	end
+
+	local maxH = 1
+	local maxV = 1
+
+	for _, component in ipairs(components) do
+		maxH = math.max(maxH, component.H)
+		maxV = math.max(maxV, component.V)
+
+		if not quantizationTables[component.QuantID] then
+			error("JPEG component references a missing quantization table")
+		end
+	end
+
+	if #components == 3 then
+		if maxH % 1 ~= 0 or maxV % 1 ~= 0 then
+			error("Invalid JPEG sampling configuration")
+		end
+	end
+
+	local mcuWidth = maxH * 8
+	local mcuHeight = maxV * 8
+	local mcuColumns = math.ceil(width / mcuWidth)
+	local mcuRows = math.ceil(height / mcuHeight)
+	local totalMCUs = mcuColumns * mcuRows
+
+	for _, component in ipairs(components) do
+		component.PlaneWidth = mcuColumns * component.H * 8
+		component.PlaneHeight = mcuRows * component.V * 8
+		component.Plane = table.create(component.PlaneWidth * component.PlaneHeight, 0)
+	end
+
+	local bitBuffer = 0
+	local bitCount = 0
+	local bytePosition = scanPosition
+
+	local function ReadEntropyBit()
+		if bitCount == 0 then
+			local value = data:byte(bytePosition)
+
+			if value == nil then
+				error("JPEG entropy stream ended unexpectedly")
+			end
+
+			bytePosition += 1
+
+			if value == 0xFF then
+				local following = data:byte(bytePosition)
+
+				if following == 0x00 then
+					bytePosition += 1
+				else
+					error("Unexpected JPEG marker inside entropy data")
+				end
+			end
+
+			bitBuffer = value
+			bitCount = 8
+		end
+
+		local bit = bit32.band(bit32.rshift(bitBuffer, bitCount - 1), 1)
+		bitCount -= 1
+
+		return bit
+	end
+
+	local function ReadEntropyBits(count)
+		local value = 0
+
+		for _ = 1, count do
+			value = value * 2 + ReadEntropyBit()
+		end
+
+		return value
+	end
+
+	local function ReadHuffman(tableData)
+		local code = 0
+
+		for length = 1, 16 do
+			code = code * 2 + ReadEntropyBit()
+
+			local entries = tableData[length]
+			local symbol = entries and entries[code]
+
+			if symbol ~= nil then
+				return symbol
+			end
+		end
+
+		error("Invalid JPEG Huffman code")
+	end
+
+	local function DecodeBlock(component, dcTable, acTable)
+		local coefficients = table.create(64, 0)
+
+		local dcLength = ReadHuffman(dcTable)
+
+		if dcLength > 11 then
+			error("Invalid JPEG DC coefficient length")
+		end
+
+		local difference = JPEGExtend(ReadEntropyBits(dcLength), dcLength)
+		component.DC += difference
+		coefficients[1] = component.DC
+
+		local k = 1
+
+		while k < 64 do
+			local symbol = ReadHuffman(acTable)
+			local run = bit32.rshift(symbol, 4)
+			local size = bit32.band(symbol, 0x0F)
+
+			if size == 0 then
+				if run == 0 then
+					break
+				elseif run == 15 then
+					k += 16
+				else
+					error("Invalid JPEG AC run")
+				end
+			else
+				k += run
+
+				if k > 63 then
+					error("JPEG AC coefficient exceeds block")
+				end
+
+				local value = JPEGExtend(ReadEntropyBits(size), size)
+				coefficients[JPEG_ZIGZAG[k + 1] + 1] = value
+				k += 1
+			end
+		end
+
+		return JPEGIDCT(coefficients, quantizationTables[component.QuantID])
+	end
+
+	local function StoreBlock(component, block, blockX, blockY)
+		local plane = component.Plane
+		local planeWidth = component.PlaneWidth
+		local startX = blockX * 8
+		local startY = blockY * 8
+
+		for y = 0, 7 do
+			local destination = (startY + y) * planeWidth + startX + 1
+			local source = y * 8
+
+			for x = 0, 7 do
+				plane[destination + x] = block[source + x + 1]
+			end
+		end
+	end
+
+	local function ResetEntropyForRestart(expectedMarker)
+		bitBuffer = 0
+		bitCount = 0
+
+		if data:byte(bytePosition) ~= 0xFF then
+			error("JPEG restart marker is missing")
+		end
+
+		while data:byte(bytePosition) == 0xFF do
+			bytePosition += 1
+		end
+
+		local marker = data:byte(bytePosition)
+		bytePosition += 1
+
+		if marker ~= expectedMarker then
+			error("Unexpected JPEG restart marker")
+		end
+
+		for _, component in ipairs(components) do
+			component.DC = 0
+		end
+	end
+
+	local mcuIndex = 0
+	local restartNumber = 0
+
+	for mcuY = 0, mcuRows - 1 do
+		for mcuX = 0, mcuColumns - 1 do
+			mcuIndex += 1
+
+			for _, scanComponent in ipairs(scanComponents) do
+				local component = scanComponent.Component
+
+				for blockY = 0, component.V - 1 do
+					for blockX = 0, component.H - 1 do
+						local block = DecodeBlock(
+							component,
+							scanComponent.DC,
+							scanComponent.AC
+						)
+
+						StoreBlock(
+							component,
+							block,
+							mcuX * component.H + blockX,
+							mcuY * component.V + blockY
+						)
+					end
+				end
+			end
+
+			if restartInterval > 0
+				and mcuIndex < totalMCUs
+				and mcuIndex % restartInterval == 0 then
+
+				ResetEntropyForRestart(0xD0 + restartNumber)
+				restartNumber = (restartNumber + 1) % 8
+			end
+
+			if mcuIndex % 256 == 0 then
+				task.wait()
+			end
+		end
+	end
+
+	local outputChunks = {}
+	local outputChunk = {}
+	local outputCount = 0
+	local pixelCount = width * height
+
+	local yComponent = components[1]
+	local cbComponent = components[2]
+	local crComponent = components[3]
+
+	local function GetPlaneSample(component, x, y)
+		local sampleX = math.floor(x * component.H / maxH)
+		local sampleY = math.floor(y * component.V / maxV)
+
+		sampleX = math.min(sampleX, component.PlaneWidth - 1)
+		sampleY = math.min(sampleY, component.PlaneHeight - 1)
+
+		return component.Plane[sampleY * component.PlaneWidth + sampleX + 1]
+	end
+
+	for y = 0, height - 1 do
+		for x = 0, width - 1 do
+			local red
+			local green
+			local blue
+
+			if #components == 1 then
+				local gray = GetPlaneSample(yComponent, x, y)
+				red, green, blue = gray, gray, gray
+			else
+				local luminance = GetPlaneSample(yComponent, x, y)
+				local cb = GetPlaneSample(cbComponent, x, y) - 128
+				local cr = GetPlaneSample(crComponent, x, y) - 128
+
+				red = JPEGClamp(luminance + 1.402 * cr)
+				green = JPEGClamp(luminance - 0.344136 * cb - 0.714136 * cr)
+				blue = JPEGClamp(luminance + 1.772 * cb)
+			end
+
+			outputCount += 1
+			outputChunk[#outputChunk + 1] = red
+			outputChunk[#outputChunk + 1] = green
+			outputChunk[#outputChunk + 1] = blue
+			outputChunk[#outputChunk + 1] = 255
+
+			if #outputChunk >= 4096 then
+				outputChunks[#outputChunks + 1] = string.char(table.unpack(outputChunk))
+				table.clear(outputChunk)
+			end
+		end
+
+		if y % 32 == 0 then
+			task.wait()
+		end
+	end
+
+	if #outputChunk > 0 then
+		outputChunks[#outputChunks + 1] = string.char(table.unpack(outputChunk))
+	end
+
+	if outputCount ~= pixelCount then
+		error("JPEG decoder produced an incorrect pixel count")
+	end
+
+	return table.concat(outputChunks), width, height
+end
+
+function ImageService:GetImage(url, options): imageData
+	options = options or {}
+
+	assert(type(url) == "string" and url ~= "", "Invalid image URL")
+
+	local success, response = pcall(function()
+		return request({
+			Url = url,
+			Method = "GET",
+			Headers = {
+				["User-Agent"] = "Mozilla/5.0",
+				["Referer"] = "https://gelbooru.com/",
+				["Accept"] = "image/png,image/jpeg,image/webp,*/*;q=0.8",
+			},
+		})
+	end)
+
+	if not success then
+		error("Image download failed: " .. tostring(response))
+	end
+
+	if type(response) ~= "table" then
+		error("Invalid HTTP response")
+	end
+
+	if response.StatusCode ~= 200 then
+		error("Image download HTTP error: " .. tostring(response.StatusCode))
 	end
 
 	local data = response.Body
+
+	if type(data) ~= "string" or #data == 0 then
+		error("Image response was empty")
+	end
 
 	local isPNG = data:sub(1, 8) == "\137PNG\r\n\26\n"
 	local isJPEG = data:byte(1) == 0xFF and data:byte(2) == 0xD8
 	local isWebP = data:sub(1, 4) == "RIFF"
 		and data:sub(9, 12) == "WEBP"
 
-	if not isPNG and not isJPEG and not isWebP then
-		error("Unsupported image data returned by server")
-	end
+	local width
+	local height
 
 	if isJPEG then
-		local encodedURL = game:GetService("HttpService"):UrlEncode(url)
+		local decoded, jpegWidth, jpegHeight = DecodeJPEG(data, {
+			MaxPixels = options.MaxPixels or 8000000,
+		})
 
-		local conversionURLs = {
-			"https://wsrv.nl/?url=" .. encodedURL .. "&output=png",
-			"https://images.weserv.nl/?url=" .. encodedURL .. "&output=png",
-		}
+		width = jpegWidth
+		height = jpegHeight
 
-		local conversionErrors = {}
+		local png, encodeError = self:EncodePNG(decoded, width, height)
 
-		local convertedData
-
-		for _, conversionURL in ipairs(conversionURLs) do
-			local converted, conversionError = Download(
-				conversionURL,
-				"https://gelbooru.com/"
-			)
-
-			if converted then
-				local convertedBody = converted.Body
-
-				if convertedBody:sub(1, 8) == "\137PNG\r\n\26\n" then
-					convertedData = convertedBody
-					break
-				else
-					conversionErrors[#conversionErrors + 1] =
-						"Converter returned unsupported data"
-				end
-			else
-				conversionErrors[#conversionErrors + 1] =
-					tostring(conversionError)
-			end
+		if not png then
+			error("JPEG PNG encoding failed: " .. tostring(encodeError))
 		end
 
-		if not convertedData then
-			error(
-				"JPEG conversion failed: "
-				.. table.concat(conversionErrors, "; ")
-			)
+		data = png
+
+	elseif isPNG or isWebP then
+		local sizeError
+		width, height, sizeError = GetSizeFromBytes(data)
+
+		if not width or not height then
+			error("Could not read image dimensions: " .. tostring(sizeError))
 		end
 
-		data = convertedData
-	end
-
-	local width, height, sizeError = GetSizeFromBytes(data)
-
-	if not width or not height then
-		error("Could not determine image dimensions: " .. tostring(sizeError))
+	else
+		error("Unsupported image format")
 	end
 
 	return {
