@@ -223,12 +223,19 @@ end
 
 local function ReadSubBlocks(data, pos)
     local blocks = {}
+    local blockCount = 0
 
-    while true and task.wait() do
+    while true do
+        blockCount += 1
+
+        if blockCount % 64 == 0 then
+            task.wait()
+        end
+
         local size = data:byte(pos)
 
         if not size then
-            warn("Unexpected end of GIF sub-blocks")
+            error("Unexpected end of GIF sub-blocks")
         end
 
         pos += 1
@@ -240,7 +247,7 @@ local function ReadSubBlocks(data, pos)
         local block = data:sub(pos, pos + size - 1)
 
         if #block ~= size then
-            warn("Incomplete GIF sub-block")
+            error("Incomplete GIF sub-block")
         end
 
         blocks[#blocks + 1] = block
@@ -268,6 +275,7 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
 
     local bitPosition = 0
     local output = {}
+	local processedCodes = 0
 
     local function ResetDictionary()
         table.clear(prefix)
@@ -308,7 +316,7 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
         local stack = {}
         local depth = 0
 
-        while (code >= clearCode) and task.wait() do
+        while code >= clearCode do
             if code >= nextCode then
                 warn("Invalid GIF LZW dictionary reference")
             end
@@ -345,8 +353,14 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
     local oldCode = nil
     local oldFirst = nil
 
-    while true and task.wait() do
-        local code = ReadCode()
+    while true do
+		processedCodes += 1
+
+		if processedCodes % 2048 == 0 then
+			task.wait()
+		end
+
+		local code = ReadCode()
 
         if code == nil then
             warn("GIF LZW stream ended unexpectedly")
@@ -898,26 +912,40 @@ end
 --// DOWNLOAD AND DECODE GIF
 
 function ImageService:GetGIF(url)
-    local response = request({
-        Url = url,
-        Method = "GET"
-    })
+    warn("[GIF] Sending HTTP request...")
 
-    if not response or not response.Body then
-        return nil, "Empty HTTP response"
+    local requestSuccess, response = pcall(function()
+        return request({
+            Url = url,
+            Method = "GET"
+        })
+    end)
+
+    if not requestSuccess then
+        return nil, "HTTP request failed: " .. tostring(response)
     end
 
-    if response.StatusCode < 200 or response.StatusCode >= 300 then
-        return nil, "HTTP warn: " .. tostring(response.StatusCode)
+    warn("[GIF] HTTP request returned")
+
+    if not response or type(response.Body) ~= "string" then
+        return nil, "Empty or invalid HTTP response"
     end
+
+    warn("[GIF] Downloaded bytes:", #response.Body)
+    warn("[GIF] Signature:", response.Body:sub(1, 6))
+    warn("[GIF] Starting decoder...")
 
     local animation, err = self:DecodeGIF(response.Body)
+
+    warn("[GIF] Decoder finished")
 
     if not animation then
         return nil, err
     end
 
     animation.StatusCode = response.StatusCode
+
+    warn("[GIF] Frames decoded:", animation.FrameCount)
 
     return animation
 end
@@ -935,16 +963,19 @@ function ImageService:PrepareGIF(animation)
     }
 
     for i, frame in ipairs(animation.Frames) do
+        local png, err = self:EncodePNG(
+            frame.Data,
+            frame.Width or animation.Width,
+            frame.Height or animation.Height
+        )
+
+        if not png then
+            error("Failed to encode GIF frame " .. i .. ": " .. tostring(err))
+        end
+
         prepared.Frames[i] = {
-            Data = self:EncodePNG(
-                frame.RGBA,
-                animation.Width,
-                animation.Height
-            ),
-            Delay = math.max(
-                (frame.Delay or 0.1),
-                0.02
-            )
+            Data = png,
+            Delay = math.max(frame.Delay or 0.1, 0.02)
         }
     end
 
