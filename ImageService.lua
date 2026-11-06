@@ -73,7 +73,7 @@ local function ReadJPEGSize(data): (number?, number?, string?)
 
 	local pos = 3
 
-	while pos < #data do
+	while (pos < #data) and task.wait() do
 		if data:byte(pos) ~= 0xFF then
 			pos += 1
 			continue
@@ -224,7 +224,7 @@ end
 local function ReadSubBlocks(data, pos)
     local blocks = {}
 
-    while true do
+    while true and task.wait() do
         local size = data:byte(pos)
 
         if not size then
@@ -308,7 +308,7 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
         local stack = {}
         local depth = 0
 
-        while code >= clearCode do
+        while (code >= clearCode) and task.wait() do
             if code >= nextCode then
                 warn("Invalid GIF LZW dictionary reference")
             end
@@ -345,7 +345,7 @@ local function DecodeLZW(data, minimumCodeSize, expectedPixels)
     local oldCode = nil
     local oldFirst = nil
 
-    while true do
+    while true and task.wait() do
         local code = ReadCode()
 
         if code == nil then
@@ -622,7 +622,7 @@ function ImageService:DecodeGIF(data, limits)
         local previousFrame = nil
         local previousSnapshot = nil
 
-        while pos <= #data do
+        while (pos <= #data) and task.wait() do
             local introducer = data:byte(pos)
             pos += 1
 
@@ -938,7 +938,7 @@ function ImageService:PlayGIF(animation, image, encodeFrame)
     task.spawn(function()
         local pass = 0
 
-        while not stopped do
+        while (not stopped) and task.wait() do
             pass += 1
 
             for _, frame in ipairs(animation.Frames) do
@@ -1070,7 +1070,7 @@ local function ZlibStore(data)
     local pos = 1
     local length = #data
 
-    while pos <= length do
+    while (pos <= length) and task.wait() do
         local blockSize = math.min(
             65535,
             length - pos + 1
