@@ -164,13 +164,99 @@ function ImageService:GetImage(url): imageData
 end
 
 function ImageService:CalculateNewSize(width, height, targetWidth): Vector2
-	assert(type(width) == "number" and width > 0, "Invalid image width")
-	assert(type(height) == "number" and height > 0, "Invalid image height")
+    assert(type(width) == "number" and width > 0, "Invalid image width")
+    assert(type(height) == "number" and height > 0, "Invalid image height")
 
-	local targetW = targetWidth or 500
-	local targetHeight = targetW * (height / width)
+    local targetW = targetWidth or 500
+    assert(type(targetW) == "number" and targetW > 0, "Invalid target width")
 
-	return Vector2.new(targetW, targetHeight)
+    local targetHeight = targetW * (height / width)
+    return Vector2.new(targetW, targetHeight)
+end
+
+-- Calculates a size from a target height while preserving aspect ratio.
+function ImageService:CalculateNewSizeFromHeight(width, height, targetHeight): Vector2
+    assert(type(width) == "number" and width > 0, "Invalid image width")
+    assert(type(height) == "number" and height > 0, "Invalid image height")
+    assert(type(targetHeight) == "number" and targetHeight > 0, "Invalid target height")
+
+    local targetWidth = targetHeight * (width / height)
+    return Vector2.new(targetWidth, targetHeight)
+end
+
+-- Returns original width, original height, and width/height ratio.
+-- Original dimensions are used when the decoded GIF was downscaled.
+function ImageService:GetGIFProportions(animation)
+    assert(type(animation) == "table", "Invalid GIF animation")
+
+    local width = tonumber(animation.OriginalWidth) or tonumber(animation.Width)
+    local height = tonumber(animation.OriginalHeight) or tonumber(animation.Height)
+    assert(width and width > 0, "GIF has an invalid width")
+    assert(height and height > 0, "GIF has an invalid height")
+
+    return width, height, width / height
+end
+
+-- Returns the GIF's original size, or its size at the requested width.
+function ImageService:GetGIFSize(animation, targetWidth): Vector2
+    local width, height = self:GetGIFProportions(animation)
+
+    if targetWidth ~= nil then
+        return self:CalculateNewSize(width, height, targetWidth)
+    end
+
+    return Vector2.new(width, height)
+end
+
+-- Scales the currently displayed Drawing image by a multiplier.
+-- Keeps the visual center fixed unless keepCenter is false.
+function ImageService:ScaleGIF(image, scale, keepCenter): Vector2
+    assert(image and image.Size, "Missing Drawing image")
+    assert(type(scale) == "number" and scale > 0, "Scale must be greater than zero")
+
+    local oldSize = image.Size
+    local newSize = Vector2.new(oldSize.X * scale, oldSize.Y * scale)
+
+    if keepCenter ~= false then
+        image.Position = image.Position + (oldSize - newSize) / 2
+    end
+
+    image.Size = newSize
+    return newSize
+end
+
+-- Sets a Drawing image to a specific width using the GIF's original ratio.
+-- Keeps the visual center fixed unless keepCenter is false.
+function ImageService:ResizeGIF(image, animation, targetWidth, keepCenter): Vector2
+    assert(image and image.Size, "Missing Drawing image")
+
+    local newSize = self:GetGIFSize(animation, targetWidth)
+    local oldSize = image.Size
+
+    if keepCenter ~= false then
+        image.Position = image.Position + (oldSize - newSize) / 2
+    end
+
+    image.Size = newSize
+    return newSize
+end
+
+-- Fits a GIF inside a bounding box without stretching it.
+-- The current image.Size is used when boundsSize is omitted.
+function ImageService:FitGIF(image, animation, boundsSize): Vector2
+    assert(image and image.Size, "Missing Drawing image")
+
+    local width, height = self:GetGIFProportions(animation)
+    local box = boundsSize or image.Size
+    assert(box and box.X > 0 and box.Y > 0, "Invalid GIF bounding box")
+
+    local factor = math.min(box.X / width, box.Y / height)
+    local fittedSize = Vector2.new(width * factor, height * factor)
+    local oldPosition = image.Position
+
+    image.Size = fittedSize
+    image.Position = oldPosition + (box - fittedSize) / 2
+    return fittedSize
 end
 
 function ImageService:GetCenteredPosition(size: Vector2)
@@ -1052,22 +1138,9 @@ function ImageService:PlayGIF(animation, image, options)
         maxFPS = nil
     end
 
-    -- Treat the current Size as a bounding box, then fit the original aspect
-    -- ratio inside it. This avoids stretching landscape or portrait GIFs.
+    -- Fit the GIF's original proportions inside the requested bounding box.
     if options.PreserveAspect ~= false then
-        local width = tonumber(animation.OriginalWidth) or tonumber(animation.Width)
-        local height = tonumber(animation.OriginalHeight) or tonumber(animation.Height)
-        local boxSize = image.Size
-
-        if width and height and width > 0 and height > 0
-            and boxSize and boxSize.X > 0 and boxSize.Y > 0 then
-            local scale = math.min(boxSize.X / width, boxSize.Y / height)
-            local fittedSize = Vector2.new(width * scale, height * scale)
-            local offset = (boxSize - fittedSize) / 2
-
-            image.Size = fittedSize
-            image.Position = image.Position + offset
-        end
+        self:FitGIF(image, animation, image.Size)
     end
 
     local playback = { Running = true }
@@ -1393,9 +1466,27 @@ FUNCTIONS:
         - Downloads a regular image and returns Data, Width, Height,
           and StatusCode.
 
-    IMAGE POSITIONING:
+    IMAGE POSITIONING & ASPECT RATIOS:
     * CalculateNewSize(width, height, targetWidth)
         - Returns a Vector2 with the requested width and proportional height.
+
+    * CalculateNewSizeFromHeight(width, height, targetHeight)
+        - Returns a Vector2 with the requested height and proportional width.
+
+    * GetGIFProportions(animation)
+        - Returns original width, original height, and width/height ratio.
+
+    * GetGIFSize(animation, targetWidth)
+        - Returns the GIF's original size or its size at a requested width.
+
+    * ScaleGIF(image, scale, keepCenter)
+        - Multiplies the displayed image dimensions equally to preserve ratio.
+
+    * ResizeGIF(image, animation, targetWidth, keepCenter)
+        - Sets a specific width and calculates the proportional height.
+
+    * FitGIF(image, animation, boundsSize)
+        - Fits the GIF inside a bounding box without stretching it.
 
     * GetCenteredPosition(size)
         - Returns the top-left position needed to center an image on screen.
@@ -1473,6 +1564,28 @@ USAGE:
 
     -- When finished with the animation, release its prepared PNG data:
     ImageService:ClearPreparedGIF(prepared)
+
+PROPORTION & SCALING EXAMPLE:
+
+    local animation = ImageService:GetGIF("https://example.com/animation.gif")
+    local width, height, ratio = ImageService:GetGIFProportions(animation)
+    print("Original dimensions:", width, height)
+    print("Aspect ratio:", ratio)
+
+    local image = Drawing.new("Image")
+    image.Position = Vector2.new(100, 100)
+    image.Size = Vector2.new(300, 300) -- bounding box for PlayGIF
+    image.Visible = true
+
+    -- PlayGIF fits the GIF inside this box without stretching it.
+    local prepared = ImageService:PrepareGIF(animation)
+    local stop = ImageService:PlayGIF(prepared, image)
+
+    -- Set exact width (height is calculated from original proportions).
+    ImageService:ResizeGIF(image, prepared, 400)
+
+    -- Or scale the current image to 150% while keeping its center.
+    ImageService:ScaleGIF(image, 1.5)
 
 NOTES:
     * Lower Scale values reduce RGBA memory before preparation.
