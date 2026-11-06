@@ -177,6 +177,26 @@ function ImageService:GetImage(url): imageData
 
     local data = response.Body
 
+	local signature = data:sub(1, 12)
+	
+	print("[ImageService] Downloaded bytes:", #data)
+	print("[ImageService] First 12 bytes:",
+		table.concat({data:byte(1, 12)}, ", ")
+	)
+	
+	print("[ImageService] PNG:",
+		data:sub(1, 8) == "\137PNG\r\n\26\n"
+	)
+	
+	print("[ImageService] JPEG:",
+		data:byte(1) == 0xFF and data:byte(2) == 0xD8
+	)
+	
+	print("[ImageService] WebP:",
+		data:sub(1, 4) == "RIFF"
+		and data:sub(9, 12) == "WEBP"
+	)
+
     assert(type(data) == "string" and #data > 0,
         "Empty image response")
 
