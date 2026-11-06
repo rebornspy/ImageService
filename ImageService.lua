@@ -1237,7 +1237,7 @@ local function DecodeJPEG(data, options)
     return table.concat(outputChunks), width, height
 end
 
-function ImageService:GetImage(url, options, referer): imageData
+function ImageService:GetImage(url, options): imageData
 	options = options or {}
 
 	assert(type(url) == "string" and url ~= "", "Invalid image URL")
@@ -1248,7 +1248,7 @@ function ImageService:GetImage(url, options, referer): imageData
 			Method = "GET",
 			Headers = {
 				["User-Agent"] = "Mozilla/5.0",
-				["Referer"] = referer,
+				["Referer"] = "https://gelbooru.com/"
 				["Accept"] = "image/png,image/jpeg,image/webp,*/*;q=0.8",
 			},
 		})
