@@ -127,23 +127,36 @@ local function ReadJPEGSize(data): (number?, number?, string?)
 	return nil, nil, "SOF marker not found"
 end
 
-local function GetSizeFromBytes(bytes): (number?, number?)
-	local w, h, err
+local function GetSizeFromBytes(bytes)
+    if type(bytes) ~= "string" or #bytes < 12 then
+        return nil, nil, "Image data is empty or too small"
+    end
 
-	if bytes:sub(1, 4) == "RIFF" and bytes:sub(9, 12) == "WEBP" then
-		w, h, err = ReadWebPSize(bytes)
-	elseif bytes:byte(1) == 0xFF and bytes:byte(2) == 0xD8 then
-		w, h, err = ReadJPEGSize(bytes)
-	elseif bytes:sub(1, 8) == "\137PNG\r\n\26\n" then
-		w, h = ReadPNGSize(bytes)
-	end
+    local w, h, err
 
-	if w and h then
-		return w, h
-	else
-		warn(err)
-		return nil, nil
-	end
+    if bytes:sub(1, 8) == "\137PNG\r\n\26\n" then
+        w, h = ReadPNGSize(bytes)
+
+    elseif bytes:byte(1) == 0xFF
+        and bytes:byte(2) == 0xD8 then
+
+        w, h, err = ReadJPEGSize(bytes)
+
+    elseif bytes:sub(1, 4) == "RIFF"
+        and bytes:sub(9, 12) == "WEBP" then
+
+        w, h, err = ReadWebPSize(bytes)
+
+    else
+        err = "Unsupported image format. Signature: "
+            .. tostring(bytes:sub(1, 12):byte(1, 12))
+    end
+
+    if w and h then
+        return w, h
+    end
+
+    return nil, nil, err or "Could not read image dimensions"
 end
 
 export type imageData = {
