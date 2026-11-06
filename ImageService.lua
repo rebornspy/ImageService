@@ -175,6 +175,17 @@ function ImageService:GetImage(url): imageData
     assert(response and response.StatusCode == 200,
         "Image download failed")
 
+	print("[ImageService] Image HTTP status:", response.StatusCode)
+	print("[ImageService] Content-Type:",
+	    response.Headers and (
+	        response.Headers["Content-Type"]
+	        or response.Headers["content-type"]
+	    )
+	)
+	
+	print("[ImageService] Response preview:")
+	print(response.Body:sub(1, 500))
+
     local data = response.Body
 
 	local signature = data:sub(1, 12)
