@@ -924,54 +924,61 @@ end
 
 --// GIF ANIMATION PLAYER
 
-function ImageService:PlayGIF(animation, image, encodeFrame)
-    assert(animation and animation.Frames, "Invalid animation")
-    assert(image, "Missing Drawing image")
-    assert(type(encodeFrame) == "function", "Missing frame encoder")
+function ImageService:PrepareGIF(animation)
+    local cachedFrames = {}
 
-    local stopped = false
-
-    local function Stop()
-        stopped = true
+    for i, frame in ipairs(animation.Frames) do
+        cachedFrames[i] = {
+            Data = self:EncodePNG(
+                frame.RGBA,
+                animation.Width,
+                animation.Height
+            ),
+            Delay = math.max(frame.Delay or 0.1, 0.02)
+        }
     end
 
+    return {
+        Frames = cachedFrames,
+        Width = animation.Width,
+        Height = animation.Height,
+        LoopCount = animation.LoopCount
+    }
+end
+
+function ImageService:PlayGIF(animation, image)
+    local frames = animation.Frames
+    local running = true
+    local index = 1
+    local loops = 0
+
     task.spawn(function()
-        local pass = 0
+        while running do
+            local frame = frames[index]
 
-        while (not stopped) and task.wait() do
-            pass += 1
+            image.Data = frame.Data
+            task.wait(frame.Delay)
 
-            for _, frame in ipairs(animation.Frames) do
-                if stopped then
+            index += 1
+
+            if index > #frames then
+                index = 1
+                loops += 1
+
+                if animation.LoopCount
+                    and animation.LoopCount > 0
+                    and loops >= animation.LoopCount then
                     break
                 end
-
-                image.Data = encodeFrame(
-                    frame.Data,
-                    frame.Width,
-                    frame.Height
-                )
-
-                image.Visible = true
-
-                task.wait(math.max(frame.Delay, 0.02))
-            end
-
-            if animation.LoopCount == nil then
-                break
-            end
-
-            if animation.LoopCount == 0 then
-                continue
-            end
-
-            if pass > animation.LoopCount then
-                break
             end
         end
+
+        running = false
     end)
 
-    return Stop
+    return function()
+        running = false
+    end
 end
 
 local function UInt32BE(value)
