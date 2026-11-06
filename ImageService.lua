@@ -925,43 +925,74 @@ end
 --// GIF ANIMATION PLAYER
 
 function ImageService:PrepareGIF(animation)
-    local cachedFrames = {}
+    assert(animation and animation.Frames, "Invalid GIF animation")
+
+    local prepared = {
+        Frames = {},
+        Width = animation.Width,
+        Height = animation.Height,
+        LoopCount = animation.LoopCount
+    }
 
     for i, frame in ipairs(animation.Frames) do
-        cachedFrames[i] = {
+        prepared.Frames[i] = {
             Data = self:EncodePNG(
                 frame.RGBA,
                 animation.Width,
                 animation.Height
             ),
-            Delay = math.max(frame.Delay or 0.1, 0.02)
+            Delay = math.max(
+                (frame.Delay or 0.1),
+                0.02
+            )
         }
     end
 
-    return {
-        Frames = cachedFrames,
-        Width = animation.Width,
-        Height = animation.Height,
-        LoopCount = animation.LoopCount
-    }
+    return prepared
 end
 
 function ImageService:PlayGIF(animation, image)
+    assert(animation and animation.Frames, "Invalid animation")
+    assert(image, "Missing Drawing image")
+
     local frames = animation.Frames
-    local running = true
-    local index = 1
-    local loops = 0
+    local frameCount = #frames
+
+    assert(frameCount > 0, "GIF contains no frames")
+
+    local playback = {
+        Running = true
+    }
 
     task.spawn(function()
-        while running do
+        local index = 1
+        local loops = 0
+
+        while playback.Running do
             local frame = frames[index]
 
-            image.Data = frame.Data
+            if not frame then
+                break
+            end
+
+            local success, err = pcall(function()
+                image.Data = frame.Data
+            end)
+
+            if not success then
+                warn("GIF playback error:", err)
+                break
+            end
+
             task.wait(frame.Delay)
+
+            if not playback.Running then
+                break
+            end
 
             index += 1
 
-            if index > #frames then
+            if index > frameCount then
                 index = 1
                 loops += 1
 
@@ -973,11 +1004,11 @@ function ImageService:PlayGIF(animation, image)
             end
         end
 
-        running = false
+        playback.Running = false
     end)
 
     return function()
-        running = false
+        playback.Running = false
     end
 end
 
