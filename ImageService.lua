@@ -164,11 +164,13 @@ function ImageService:GetImage(url): imageData
 end
 
 function ImageService:CalculateNewSize(width, height, targetWidth): Vector2
-	local aspectRatio = height / width
-	local targetW = targetWidth or 500
-	local targetHeight = targetW * aspectRatio
+	assert(type(width) == "number" and width > 0, "Invalid image width")
+	assert(type(height) == "number" and height > 0, "Invalid image height")
 
-	return Vector2.new(targetWidth, targetHeight)
+	local targetW = targetWidth or 500
+	local targetHeight = targetW * (height / width)
+
+	return Vector2.new(targetW, targetHeight)
 end
 
 function ImageService:GetCenteredPosition(size: Vector2)
@@ -965,159 +967,136 @@ end
 
 --// GIF ANIMATION PLAYER
 
--- PrepareGIF intentionally does NOT encode every frame. It keeps references
--- to the decoded RGBA frames and lets PlayGIF encode only a small rolling cache.
-function ImageService:PrepareGIF(animation)
+-- PrepareGIF encodes every frame before playback. This intentionally moves
+-- the CPU cost to the preparation stage so playback only assigns PNG strings.
+-- options:
+--   ReleaseRGBA: clear the original decoded RGBA frame strings after encoding (default true)
+--   YieldEveryFrames: yield after this many prepared frames (default 1)
+function ImageService:PrepareGIF(animation, options)
+    options = options or {}
+
     assert(animation and animation.Frames, "Invalid GIF animation")
     assert(#animation.Frames > 0, "GIF contains no frames")
 
-    return {
-        Frames = animation.Frames, -- Shared reference; no duplicate frame table/data.
+    local releaseRGBA = options.ReleaseRGBA ~= false
+    local yieldEvery = math.max(1, math.floor(tonumber(options.YieldEveryFrames) or 1))
+
+    local prepared = {
+        Frames = table.create(#animation.Frames),
         Width = animation.Width,
         Height = animation.Height,
         OriginalWidth = animation.OriginalWidth or animation.Width,
         OriginalHeight = animation.OriginalHeight or animation.Height,
         LoopCount = animation.LoopCount,
-        FrameCount = animation.FrameCount or #animation.Frames,
-        Format = animation.Format or "RGBA8",
+        FrameCount = #animation.Frames,
+        Format = "PNG",
         IsPrepared = true
     }
+
+    for i, frame in ipairs(animation.Frames) do
+        assert(type(frame.Data) == "string", "GIF frame " .. i .. " has no RGBA Data")
+
+        local png, err = self:EncodePNG(
+            frame.Data,
+            frame.Width or animation.Width,
+            frame.Height or animation.Height
+        )
+
+        if not png then
+            error("Failed to encode GIF frame " .. i .. ": " .. tostring(err))
+        end
+
+        prepared.Frames[i] = {
+            Data = png,
+            Delay = math.max(tonumber(frame.Delay) or 0.1, 0.02)
+        }
+
+        -- Once encoded, the raw RGBA string is no longer needed for playback.
+        -- Releasing it avoids retaining both full frame sets in memory.
+        if releaseRGBA then
+            frame.Data = nil
+        end
+
+        if i % yieldEvery == 0 then
+            task.wait()
+        end
+    end
+
+    if releaseRGBA then
+        -- Drop the source frame array so its per-frame metadata can be collected too.
+        animation.Frames = nil
+    end
+
+    return prepared
 end
 
+-- PlayGIF only assigns pre-encoded PNG data. No PNG encoding or cache management
+-- occurs in the playback loop.
 -- options:
---   CacheFrames: number of encoded PNG frames to retain (default 2, max 8)
---   MaxFPS: optional playback FPS cap (e.g. 24 or 30)
---   MinDelay: minimum delay between frames (default 1/60 second)
+--   MaxFPS: optional cap, e.g. 24 or 30
+--   MinDelay: minimum frame delay (default 1/60)
+--   PreserveAspect: fit the GIF proportionally inside the image's initial Size (default true)
 function ImageService:PlayGIF(animation, image, options)
     options = options or {}
 
-    assert(animation and animation.Frames, "Invalid GIF animation")
+    assert(animation and animation.Frames, "Invalid prepared GIF animation")
     assert(image, "Missing Drawing image")
 
     local frames = animation.Frames
     local frameCount = #frames
     assert(frameCount > 0, "GIF contains no frames")
 
-    local cacheLimit = math.floor(tonumber(options.CacheFrames) or 2)
-    cacheLimit = math.clamp(cacheLimit, 2, 8)
-
-    local minDelay = tonumber(options.MinDelay) or (1 / 60)
-    minDelay = math.max(minDelay, 0.001)
-
+    local minDelay = math.max(tonumber(options.MinDelay) or (1 / 60), 0.001)
     local maxFPS = tonumber(options.MaxFPS)
     if maxFPS and maxFPS <= 0 then
         maxFPS = nil
     end
 
+    -- Treat the current Size as a bounding box, then fit the original aspect
+    -- ratio inside it. This avoids stretching landscape or portrait GIFs.
+    if options.PreserveAspect ~= false then
+        local width = tonumber(animation.OriginalWidth) or tonumber(animation.Width)
+        local height = tonumber(animation.OriginalHeight) or tonumber(animation.Height)
+        local boxSize = image.Size
+
+        if width and height and width > 0 and height > 0
+            and boxSize and boxSize.X > 0 and boxSize.Y > 0 then
+            local scale = math.min(boxSize.X / width, boxSize.Y / height)
+            local fittedSize = Vector2.new(width * scale, height * scale)
+            local offset = (boxSize - fittedSize) / 2
+
+            image.Size = fittedSize
+            image.Position = image.Position + offset
+        end
+    end
+
     local playback = { Running = true }
-    local pngCache = {}
-    local pending = {}
-    local failures = {}
-    local activeIndex = nil
-
-    local function trimCache(newIndex)
-        local count = 0
-        for _ in pairs(pngCache) do
-            count += 1
-        end
-
-        while count > cacheLimit do
-            local removed = false
-            for cachedIndex in pairs(pngCache) do
-                if cachedIndex ~= activeIndex and cachedIndex ~= newIndex then
-                    pngCache[cachedIndex] = nil
-                    count -= 1
-                    removed = true
-                    break
-                end
-            end
-            if not removed then
-                break
-            end
-        end
-    end
-
-    local function requestEncode(index)
-        if pngCache[index] or pending[index] or failures[index] then
-            return
-        end
-
-        pending[index] = true
-
-        task.spawn(function()
-            local frame = frames[index]
-            local ok, png, encodeError = pcall(function()
-                return self:EncodePNG(
-                    frame.Data,
-                    frame.Width or animation.Width,
-                    frame.Height or animation.Height
-                )
-            end)
-
-            pending[index] = nil
-
-            if not playback.Running then
-                return
-            end
-
-            if not ok then
-                failures[index] = tostring(png)
-                warn("GIF frame " .. index .. " encoding failed:", png)
-                return
-            end
-
-            if not png then
-                failures[index] = tostring(encodeError or "PNG encoder returned nil")
-                warn("GIF frame " .. index .. " encoding failed:", failures[index])
-                return
-            end
-
-            pngCache[index] = png
-            trimCache(index)
-        end)
-    end
-
-    local function waitForEncoded(index)
-        requestEncode(index)
-
-        while playback.Running and not pngCache[index] and not failures[index] do
-            task.wait()
-        end
-
-        return pngCache[index], failures[index]
-    end
 
     task.spawn(function()
         local index = 1
         local completedPlays = 0
         local loopCount = animation.LoopCount
 
-        -- No NETSCAPE loop extension means play once. A loop count of zero
-        -- means infinite; a positive count is the number of repeats after
-        -- the initial play.
         local function hasMorePlays()
+            -- No loop extension: play once. Zero: infinite. Positive: repeats
+            -- after the initial play, as specified by the NETSCAPE extension.
             if loopCount == nil then
                 return false
-            end
-            if loopCount == 0 then
+            elseif loopCount == 0 then
                 return true
             end
             return completedPlays <= loopCount
         end
 
         while playback.Running do
-            local png, encodeError = waitForEncoded(index)
-            if not playback.Running then
-                break
-            end
-
-            if not png then
-                warn("GIF playback stopped:", encodeError)
+            local frame = frames[index]
+            if not frame or type(frame.Data) ~= "string" then
+                warn("GIF playback stopped: prepared frame " .. index .. " is missing PNG data")
                 break
             end
 
             local assigned, assignError = pcall(function()
-                image.Data = png
+                image.Data = frame.Data
             end)
 
             if not assigned then
@@ -1125,9 +1104,6 @@ function ImageService:PlayGIF(animation, image, options)
                 break
             end
 
-            activeIndex = index
-
-            local frame = frames[index]
             local delay = tonumber(frame.Delay) or 0.1
             if delay <= 0 then
                 delay = 0.1
@@ -1137,32 +1113,46 @@ function ImageService:PlayGIF(animation, image, options)
                 delay = math.max(delay, 1 / maxFPS)
             end
 
-            local nextIndex = index + 1
-            if nextIndex > frameCount then
+            task.wait(delay)
+            if not playback.Running then
+                break
+            end
+
+            index += 1
+            if index > frameCount then
                 completedPlays += 1
                 if not hasMorePlays() then
                     break
                 end
-                nextIndex = 1
+                index = 1
             end
-
-            -- Encode the next frame while the current one is on screen.
-            requestEncode(nextIndex)
-            task.wait(delay)
-            index = nextIndex
         end
 
         playback.Running = false
-        table.clear(pending)
-        table.clear(pngCache)
-        table.clear(failures)
     end)
 
     return function()
         playback.Running = false
-        table.clear(pngCache)
-        table.clear(failures)
     end
+end
+
+-- Releases all encoded PNG frames held by a prepared animation.
+-- Call this after stopping playback when the GIF will not be reused.
+function ImageService:ClearPreparedGIF(prepared)
+    if not prepared then
+        return
+    end
+
+    if prepared.Frames then
+        for _, frame in ipairs(prepared.Frames) do
+            frame.Data = nil
+        end
+        table.clear(prepared.Frames)
+        prepared.Frames = nil
+    end
+
+    prepared.FrameCount = 0
+    prepared.IsPrepared = false
 end
 
 local function UInt32BE(value)
@@ -1394,118 +1384,103 @@ FUNCTIONS:
 
     IMAGE SIZE & RETRIEVAL:
     * Read[type]Size(data)
-        - Gets the dimensions of an image from its binary data.
-        - Supported types: PNG, JPEG, WebP.
+        - Reads dimensions for PNG, JPEG, and WebP image bytes.
 
     * GetSizeFromBytes(bytes)
-        - Automatically detects the image type and retrieves its
-          width and height.
-        - Supports PNG, JPEG, and WebP.
-        - Warns if the image type is unsupported or its dimensions
-          cannot be read.
+        - Detects PNG, JPEG, or WebP and returns width and height.
 
     * GetImage(url)
-        - Downloads image data from the given URL.
-        - Retrieves the image's width and height.
-        - Returns the image data, dimensions, and HTTP status code.
+        - Downloads a regular image and returns Data, Width, Height,
+          and StatusCode.
 
     IMAGE POSITIONING:
     * CalculateNewSize(width, height, targetWidth)
-        - Calculates the new height while preserving the image's
-          aspect ratio at the specified target width.
+        - Returns a Vector2 with the requested width and proportional height.
 
-    * GetCenteredPosition(width, height)
-        - Calculates the screen position needed to center an image
-          using the current camera's viewport dimensions.
+    * GetCenteredPosition(size)
+        - Returns the top-left position needed to center an image on screen.
 
-    IMAGE CREATION:
     * Create(url)
-        - Downloads an image and creates a Drawing image object.
-        - Uses the image's original dimensions.
-        - Positions the image in the center of the screen.
+        - Downloads a regular image and creates a centered Drawing image.
 
     GIF DECODING:
     * DecodeGIF(data, limits)
-        - Decodes GIF87a and GIF89a binary data.
-        - Supports GIF LZW decompression, global and local color
-          tables, transparency, frame delays, and interlacing.
-        - Handles frame disposal methods 0 through 3.
-        - Composites frames onto a canvas and returns full RGBA
-          frame data.
-        - Reads GIF looping information when available.
-        - Supports optional limits to help control frame count
-          and image dimensions.
+        - Decodes GIF87a/GIF89a, including LZW, palettes, transparency,
+          interlacing, frame delays, disposal, and loop metadata.
+        - limits.Scale can downsample frames; MaxFrames and MaxPixels
+          constrain decoded input size.
+        - Returns composited RGBA frames in frame.Data.
 
     * GetGIF(url, limits)
-        - Downloads GIF data from the given URL.
-        - Passes optional decoding limits (including Scale) to DecodeGIF.
-        - Returns the decoded animation information.
+        - Downloads a GIF and decodes it using the optional limits table.
 
-    GIF PLAYBACK:
-    * PlayGIF(animation, image, options)
-        - Plays a decoded GIF using an existing Drawing image.
-        - Encodes frames just before they are needed and prefetches
-          the next frame while the current frame is displayed.
-        - Keeps only a small rolling PNG cache to reduce memory use.
-        - Supports CacheFrames, MaxFPS, and MinDelay options.
-        - Returns a function that stops playback.
+    GIF PREPARATION & PLAYBACK:
+    * PrepareGIF(animation, options)
+        - Encodes every decoded RGBA frame to PNG before playback.
+        - This moves encoding work out of the playback loop.
+        - ReleaseRGBA defaults to true, clearing the original RGBA frame
+          data after each successful PNG encode to reduce retained memory.
+          Set ReleaseRGBA = false to keep the source frames.
+        - YieldEveryFrames controls how often preparation yields (default 1).
+
+    * PlayGIF(prepared, image, options)
+        - Playback only assigns pre-encoded PNG frames; it does no encoding.
+        - MaxFPS and MinDelay can limit update frequency.
+        - PreserveAspect defaults to true and fits the GIF inside the
+          Drawing image's initial Size bounding box without stretching.
+        - Returns a stop function.
+
+    * ClearPreparedGIF(prepared)
+        - Clears encoded PNG frame data when the prepared animation is
+          no longer needed. Stop playback before calling this.
 
     PNG ENCODING:
     * EncodePNG(rgba, width, height)
-        - Encodes raw RGBA pixel data into PNG binary data.
-        - Uses 8-bit RGBA color and PNG filter type 0.
-        - Generates PNG chunks, CRC-32 checksums, and a zlib
-          stream using uncompressed DEFLATE blocks.
-        - Returns the resulting PNG data as a string.
+        - Encodes raw RGBA pixels as an 8-bit RGBA PNG.
+        - Uses filter type 0 and uncompressed DEFLATE blocks.
 
 USAGE:
 
-    local ImageService = loadstring(game:HttpGet(
-        `https://raw.githubusercontent.com/rebornspy/ImageService/refs/heads/main/ImageService.lua?cachebust={tick()}`,
-        true
-    ))()
-
-    -- Create and center a regular image:
-    local image = ImageService:Create(
-        "https://static.wikia.nocookie.net/charlie-the-steak/images/c/c9/Charlie.png"
-    )
-
-    -- Decode at half resolution to reduce RGBA memory by about 75%:
-    local animation = ImageService:GetGIF(
+    local animation, err = ImageService:GetGIF(
         "https://example.com/animation.gif",
         { Scale = 0.5, MaxFrames = 300, MaxPixels = 4000000 }
     )
 
-    -- PrepareGIF now retains references; it does not encode every frame:
-    local prepared = ImageService:PrepareGIF(animation)
+    if not animation then
+        warn("GIF decode failed:", err)
+        return
+    end
 
-    -- Keep only two encoded PNG frames and cap playback at 24 FPS:
+    -- This is where PNG encoding happens, before playback starts.
+    local prepared = ImageService:PrepareGIF(animation, {
+        ReleaseRGBA = true,
+        YieldEveryFrames = 1
+    })
+
     local image = Drawing.new("Image")
-    image.Size = Vector2.new(300, 200)
     image.Position = Vector2.new(100, 100)
+    image.Size = Vector2.new(300, 300) -- treated as a bounding box
     image.Visible = true
 
     local stopPlayback = ImageService:PlayGIF(prepared, image, {
-        CacheFrames = 2,
         MaxFPS = 24,
-        MinDelay = 1 / 30
+        MinDelay = 1 / 30,
+        PreserveAspect = true
     })
 
-    -- Stop GIF playback:
+    -- Stop playback:
     stopPlayback()
 
+    -- When finished with the animation, release its prepared PNG data:
+    ImageService:ClearPreparedGIF(prepared)
+
 NOTES:
-    * GIF decoding and PNG encoding operate on binary image data.
-    * GetGIF accepts Scale between 0 and 1. Lower values reduce the
-      stored RGBA frame dimensions and memory footprint.
-    * PrepareGIF does not duplicate or PNG-encode all decoded frames.
-    * PlayGIF lazily encodes frames, prefetches one frame ahead, and
-      retains only a bounded cache of encoded PNG frames.
-    * The PNG encoder currently uses uncompressed DEFLATE blocks.
-      This produces valid PNG structure but larger files than
-      compressed PNG encoders.
-    * Large GIFs can consume significant memory. Use decoding limits
-      when processing untrusted or high-resolution images.
-    * GIF decoding and encoding should be tested against the target
-      Luau runtime and Drawing implementation.
+    * Lower Scale values reduce RGBA memory before preparation.
+    * Preparing all PNG frames takes work up front, but playback avoids
+      per-frame encoding stutters.
+    * The PNG encoder uses stored (uncompressed) DEFLATE blocks, so PNG
+      frames are larger than they would be with a compressed encoder.
+    * Garbage collection reclaims released strings over time; setting
+      references to nil does not guarantee immediate memory reduction.
+    * Test against the target Luau runtime and Drawing implementation.
 ]]
