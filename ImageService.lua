@@ -724,7 +724,7 @@ local function DecodeJPEG(data, options)
                     elseif run ~= 15 then
                         eobRun = 2 ^ run + ReadBits(run)
                         break
-                    else
+					else
                         run = 16
                         isZRL = true
                     end
@@ -938,7 +938,7 @@ local function DecodeJPEG(data, options)
             or marker == 0xC7 or marker == 0xC9 or marker == 0xCA or marker == 0xCB
             or marker == 0xCD or marker == 0xCE or marker == 0xCF then
             error("Unsupported JPEG frame type; only SOF0 and SOF2 are supported")
-        elseif marker == 0xDB then
+        elseif marker == 0xDB then -- DQT
             local cursor = payload
             while cursor <= payloadEnd do
                 local info = data:byte(cursor)
@@ -1733,10 +1733,11 @@ function ImageService:DecodeGIF(data, limits)
 
 	local progressEnabled = limits.Progress == true
 	local progressEvery = math.max(1, math.floor(tonumber(limits.ProgressEveryFrames) or 10))
+	local yieldEveryFrames = math.max(0, math.floor(tonumber(limits.YieldEveryFrames) or 1))
 	GIFProgress("Starting decoder...", progressEnabled)
 
-	local MAX_PIXELS = limits.MaxPixels or 4000000
-	local MAX_FRAMES = limits.MaxFrames or 500
+	local MAX_PIXELS = math.max(1, math.floor(tonumber(limits.MaxPixels) or 4000000))
+	local MAX_FRAMES = math.max(1, math.floor(tonumber(limits.MaxFrames) or 500))
 	local outputScale = limits.Scale or 1
 
 	if type(outputScale) ~= "number" or outputScale <= 0 or outputScale > 1 then
@@ -1770,7 +1771,7 @@ function ImageService:DecodeGIF(data, limits)
 		)
 
 		if totalPixels > MAX_PIXELS then
-			warn("GIF exceeds maximum canvas dimensions")
+			error(string.format("GIF canvas is too large (%d pixels; limit is %d)", totalPixels, MAX_PIXELS))
 		end
 
 		local packed = data:byte(11)
@@ -1795,6 +1796,7 @@ function ImageService:DecodeGIF(data, limits)
 
 		local frames = {}
 		local loopCount = nil
+		local truncated = false
 
 		local canvas = CreateCanvas(width, height)
 
@@ -1873,7 +1875,8 @@ function ImageService:DecodeGIF(data, limits)
 
 			if introducer == 0x2C then
 				if #frames >= MAX_FRAMES then
-					warn("GIF exceeds maximum frame count")
+					truncated = true
+					break
 				end
 
 				if previousFrame then
@@ -1927,7 +1930,7 @@ function ImageService:DecodeGIF(data, limits)
 				end
 
 				if frameWidth * frameHeight > MAX_PIXELS then
-					warn("GIF frame exceeds maximum pixel count")
+					error(string.format("GIF frame is too large (%d pixels; limit is %d)", frameWidth * frameHeight, MAX_PIXELS))
 				end
 
 				local localTablePresent = bit32.band(imagePacked, 0x80) ~= 0
@@ -2006,6 +2009,10 @@ function ImageService:DecodeGIF(data, limits)
 				previousFrame = frame
 				previousSnapshot = snapshot
 
+				if yieldEveryFrames > 0 and #frames % yieldEveryFrames == 0 then
+					task.wait()
+				end
+
 				gce = {
 					Disposal = 0,
 					Delay = 0,
@@ -2034,6 +2041,7 @@ function ImageService:DecodeGIF(data, limits)
 			FrameCount = #frames,
 
 			LoopCount = loopCount,
+			Truncated = truncated,
 
 			Format = "RGBA8",
 		}
@@ -2109,7 +2117,7 @@ function ImageService:PrepareGIF(animation, options)
 
 	local progressEnabled = options.Progress == true
 	local releaseRGBA = options.ReleaseRGBA ~= false
-	local yieldEvery = math.max(0, math.floor(tonumber(options.YieldEveryFrames) or 0))
+	local yieldEvery = math.max(0, math.floor(tonumber(options.YieldEveryFrames) or 1))
 	local frameCount = #animation.Frames
 	local progressEvery = math.max(1, math.floor(
 		type(options.ProgressEveryFrames) == "number"
@@ -2186,12 +2194,14 @@ function ImageService:PlayGIF(animation, image, options)
 	assert(frameCount > 0, "GIF contains no frames")
 
 	local progressEnabled = options.Progress == true
-	local minDelay = math.max(tonumber(options.MinDelay) or 0.001, 0)
+	local minDelay = math.max(tonumber(options.MinDelay) or 0, 0)
+
 	local maxFPS = tonumber(options.MaxFPS)
-	if maxFPS and maxFPS <= 0 then
-		maxFPS = nil
+	if maxFPS == nil then
+		maxFPS = 24
 	end
-	local fpsDelay = maxFPS and (1 / maxFPS) or 0
+	maxFPS = math.clamp(maxFPS, 1, 120)
+	local updateInterval = 1 / maxFPS
 
 	if options.PreserveAspect ~= false then
 		self:FitGIF(image, animation, image.Size)
@@ -2204,7 +2214,7 @@ function ImageService:PlayGIF(animation, image, options)
 		if delay <= 0 then
 			delay = 0.1
 		end
-		delay = math.max(delay, minDelay, fpsDelay)
+		delay = math.max(delay, minDelay)
 		totalDuration += delay
 		frameEnds[i] = totalDuration
 	end
@@ -2214,14 +2224,15 @@ function ImageService:PlayGIF(animation, image, options)
 	local totalTime = totalDuration * totalPlays
 	local playback = { Running = true, StopRequested = false }
 
-	GIFProgress(string.format("Playback started: %d frames.", frameCount), progressEnabled)
+	GIFProgress(string.format("Playback started: %d frames at up to %d updates/sec.", frameCount, maxFPS), progressEnabled)
 
 	task.spawn(function()
 		local startTime = os.clock()
 		local lastIndex = 0
 
 		while playback.Running do
-			local elapsed = os.clock() - startTime
+			local now = os.clock()
+			local elapsed = now - startTime
 			if elapsed >= totalTime then
 				break
 			end
@@ -2251,9 +2262,14 @@ function ImageService:PlayGIF(animation, image, options)
 				lastIndex = index
 			end
 
-			local frameEnd = frameEnds[index]
-			local deadline = startTime + playNumber * totalDuration + frameEnd
-			local remaining = deadline - os.clock()
+			local nextTickNumber = math.floor(elapsed * maxFPS) + 1
+			local nextTick = startTime + nextTickNumber * updateInterval
+			local playbackEnd = startTime + totalTime
+			if nextTick > playbackEnd then
+				nextTick = playbackEnd
+			end
+
+			local remaining = nextTick - os.clock()
 			if remaining > 0 then
 				task.wait(remaining)
 			end
@@ -2497,7 +2513,8 @@ FUNCTIONS:
         - Decodes GIF87a/GIF89a, including LZW, palettes, transparency,
           interlacing, frame delays, disposal, and loop metadata.
         - limits.Scale can downsample frames; MaxFrames and MaxPixels
-          constrain decoded input size.
+          constrain decoded input size. YieldEveryFrames defaults to 1
+          to let the scheduler run between decoded frames (0 disables it).
         - Returns composited RGBA frames in frame.Data.
 
     * GetGIF(url, limits)
@@ -2513,12 +2530,16 @@ FUNCTIONS:
         - ReleaseRGBA defaults to true, clearing the original RGBA frame
           data after each successful PNG encode to reduce retained memory.
           Set ReleaseRGBA = false to keep the source frames.
-        - YieldEveryFrames controls how often preparation yields (default 1).
+        - YieldEveryFrames controls how often preparation yields (default 1;
+          0 disables yielding).
         - ProgressEveryFrames controls log frequency; Progress = false silences logs.
 
     * PlayGIF(prepared, image, options)
         - Playback only assigns pre-encoded PNG frames; it does no encoding.
-        - MaxFPS and MinDelay can limit update frequency.
+        - MaxFPS caps actual image updates (default 24) and skips overdue
+          frames without slowing the GIF's original timeline. Use a lower
+          value such as 15 to reduce CPU load further. MinDelay optionally
+          floors frame durations.
         - PreserveAspect defaults to true and fits the GIF inside the
           Drawing image's initial Size bounding box without stretching.
         - Returns a stop function.
@@ -2538,7 +2559,7 @@ USAGE:
 
     local animation, err = ImageService:GetGIF(
         "https://example.com/animation.gif",
-        { Scale = 0.5, MaxFrames = 300, MaxPixels = 4000000 }
+        { Scale = 0.5, MaxFrames = 180, MaxPixels = 2000000, YieldEveryFrames = 1 }
     )
 
     if not animation then
@@ -2558,8 +2579,8 @@ USAGE:
     image.Visible = true
 
     local stopPlayback = ImageService:PlayGIF(prepared, image, {
-        MaxFPS = 24,
-        MinDelay = 1 / 30,
+        MaxFPS = 20,
+        MinDelay = 0,
         PreserveAspect = true
     })
 
